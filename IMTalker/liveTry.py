@@ -95,7 +95,7 @@ class MoshiOnlyEngine:
         text_prompt: str = "",
         # --- STT + query routing + web search (all optional, off by default) ---
         ref_lora_dir: str = "",
-        merge_ref_lora: bool = False,
+        merge_ref_lora: bool = True,
         max_ref_tokens: int = 250,
         stt_hf_repo: str = "",
         stt_pkg_dir: str = "",
@@ -105,7 +105,7 @@ class MoshiOnlyEngine:
         stt_reject_foreign_script: bool = True,
         stt_max_non_latin_ratio: float = 0.15,
         stt_require_english: bool = True,
-        max_input_buffer_sec: float = 2.0,
+        max_input_buffer_sec: float = 6.0,
         compressor_model: str = "",
         compressor_device: str = "cuda",
         compressor_4bit: bool = True,
@@ -350,12 +350,29 @@ class MoshiOnlyEngine:
             )
         self.sys_logger.gpu_memory("after all reply-engine components")
 
-    def _load_ref_lora(self, checkpoint_dir: str, merge_lora: bool = False) -> None:
-        """Load the <lookup>/<ref> LoRA adapter onto self.lm. Unmerged by
-        default (QLoRA-style: LoRA computed at forward time on top of the 4-bit
-        base, not merged into the quantized weights). PEFT mutates self.lm's
-        target submodules in place -- self.lm keeps pointing at the same, now
-        LoRA-augmented, object either way."""
+    def _load_ref_lora(self, checkpoint_dir: str, merge_lora: bool = True) -> None:
+        """Load the <lookup>/<ref> LoRA adapter onto self.lm.
+
+        MERGED by default, and that default matters a great deal here.
+
+        This adapter's target_modules are ["proj", "fc1", "out_proj", "fc2",
+        "linear", "in_proj"], which PEFT matches by suffix -- so it attaches to
+        very nearly every projection in the 7B model, main transformer and
+        depformer alike, at r=128 with alpha/r=2.0. Left UNMERGED, every one of
+        those layers pays two extra matmuls on every forward pass, and this
+        model runs 12.5 forward passes per second for the entire session
+        (whether or not the turn uses search). In a pipeline that has to hold
+        real time, that is not an affordable tax: once the producer drops below
+        1x real time the audio sender -- which paces on a fixed 80ms grid --
+        starves continuously and the browser hears silence rather than choppy
+        speech.
+
+        merge_and_unload() folds the adapter into the base weights once at
+        startup, so the live forward pass costs exactly what the base model
+        costs. On a bnb-4bit base PEFT dequantizes, adds, and requantizes,
+        which loses a little precision -- an acceptable trade for a real-time
+        pipeline, and the reason the fallback below is a loud warning rather
+        than a silent downgrade."""
         lora_path = Path(checkpoint_dir) / "lora"
         self.sys_logger.path("ref_lora_dir", lora_path, required=False)
         if not lora_path.exists():
@@ -373,19 +390,44 @@ class MoshiOnlyEngine:
             print(f"[liveTry] loading reference LoRA from {lora_path} (merge={merge_lora})", flush=True)
             t_lora = time.perf_counter()
             peft_model = PeftModel.from_pretrained(self.lm, str(lora_path))
+            merged = False
             if merge_lora:
-                self.lm = peft_model.merge_and_unload()
+                try:
+                    self.lm = peft_model.merge_and_unload()
+                    merged = True
+                except Exception as merge_exc:
+                    # Not all peft/bitsandbytes combinations can fold an adapter
+                    # into 4-bit weights. Falling back keeps the feature working,
+                    # but it reintroduces the per-step cost, so say so loudly
+                    # instead of leaving a silent performance cliff.
+                    tb_merge = traceback.format_exc()
+                    print(
+                        f"[liveTry] WARNING could not merge the reference LoRA into the 4-bit "
+                        f"base ({merge_exc!r}); continuing UNMERGED. The adapter still works, but "
+                        f"every model step now pays extra matmuls on nearly every projection, "
+                        f"which can push this pipeline below real time and starve the audio "
+                        f"sender. If the avatar goes quiet, launch with ENABLE_SEARCH=0 or "
+                        f"upgrade peft.\n{tb_merge}",
+                        flush=True,
+                    )
+                    self.sys_logger.component_failed("reference_lora_merge", merge_exc, tb_merge)
             lora_s = time.perf_counter() - t_lora
-            print(f"[liveTry] reference LoRA loaded from {lora_path} in {lora_s:.2f}s", flush=True)
+            print(
+                f"[liveTry] reference LoRA loaded from {lora_path} in {lora_s:.2f}s "
+                f"(merged={merged})",
+                flush=True,
+            )
             cfg = {}
             with contextlib.suppress(Exception):
                 cfg = json.loads((lora_path / "adapter_config.json").read_text(encoding="utf-8"))
             self.sys_logger.lora_loaded(
                 "reference_lora (<lookup>/<ref> context injection)", str(lora_path),
-                merged=bool(merge_lora), rank=cfg.get("r"), alpha=cfg.get("lora_alpha"),
+                merged=merged, rank=cfg.get("r"), alpha=cfg.get("lora_alpha"),
                 target="personaplex_lm", load_s=round(lora_s, 3),
                 target_modules=cfg.get("target_modules"),
                 peft_type=cfg.get("peft_type"), dropout=cfg.get("lora_dropout"),
+                per_step_cost=("none (folded into base weights)" if merged
+                               else "EXTRA MATMULS ON EVERY STEP -- unmerged"),
             )
         except Exception as e:
             tb = traceback.format_exc()

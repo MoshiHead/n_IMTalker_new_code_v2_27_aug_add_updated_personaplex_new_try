@@ -208,9 +208,31 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         capture_layer: int = -2,
         thinking_sound_path: str = "",
         search_max_filler_sec: float = 6.0,
+        stt_inline: bool = False,
+        stt_queue_frames: int = 64,
         **kwargs,
     ) -> None:
         self.tf_capture_layer = int(capture_layer)
+        # Must exist before super().__init__() -- it runs reset_session() during
+        # warmup, and _step() can be reached from there.
+        self.stt_inline = bool(stt_inline)
+        self._stt_queue: "queue.Queue | None" = None
+        self._stt_thread: threading.Thread | None = None
+        self._stt_stop = threading.Event()
+        # Serializes STT model access between the worker thread and the
+        # session reset on the GPU thread. Uncontended in steady state:
+        # only the worker ever takes it during normal operation.
+        self._stt_lock = threading.RLock()
+        self._stt_dropped_frames = 0
+        self._stt_drop_last_log = 0.0
+        # Real-time factor accounting. This is THE number that tells you whether
+        # the pipeline can hold a live conversation: it is audio seconds
+        # consumed divided by wall seconds elapsed. Below 1.0 the producer is
+        # falling behind permanently, the fixed-cadence audio sender starves,
+        # and the browser hears silence rather than slow speech -- so it needs
+        # to be measured continuously, not inferred after the fact.
+        self._rt_frames = 0
+        self._rt_wall_start = 0.0
         super().__init__(*args, **kwargs)
 
         # How long a turn may wait for routing + search + compression before
@@ -267,6 +289,44 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                 self.sys_logger.path("thinking_sound", thinking_sound_path, required=False)
 
         self._install_graph_hidden_capture()
+
+        # The STT worker starts last: the STT submodel is loaded at the very end
+        # of the base constructor, so nothing before this point could feed it.
+        if self.stt_lm_gen is not None and not self.stt_inline:
+            self._stt_queue = queue.Queue(maxsize=max(8, int(stt_queue_frames)))
+            self._stt_thread = threading.Thread(
+                target=self._stt_worker_loop, name="stt-vad", daemon=True
+            )
+            self._stt_thread.start()
+            self.sys_logger.event(
+                "stt_worker",
+                f"STT/VAD runs on its own thread and CUDA stream "
+                f"(queue={self._stt_queue.maxsize} frames = "
+                f"{self._stt_queue.maxsize * MIMI_FRAME_SIZE / TARGET_SR:.1f}s of audio). "
+                f"Keeps a 1B forward and two device syncs off the 80ms real-time budget.",
+                queue_frames=self._stt_queue.maxsize, inline=False,
+            )
+        elif self.stt_lm_gen is not None:
+            print(
+                "[liveTryPlasticity][STT] running INLINE on the GPU thread "
+                "(--stt_inline): expect a 1B forward plus two device syncs inside "
+                "every 80ms step. Use this only to compare against the threaded path.",
+                flush=True,
+            )
+            self.sys_logger.event("stt_worker", "STT/VAD runs INLINE on the GPU thread", inline=True)
+
+    def realtime_factor(self) -> float:
+        """Audio seconds consumed per wall second, since the session started.
+
+        1.0 means the model pipeline exactly keeps up with the microphone.
+        Below 1.0 it is falling behind permanently and cannot recover on its
+        own, because the input arrives at exactly real time."""
+        if self._rt_wall_start == 0.0:
+            return 1.0
+        wall = time.perf_counter() - self._rt_wall_start
+        if wall <= 0.0:
+            return 1.0
+        return (self._rt_frames * MIMI_FRAME_SIZE / TARGET_SR) / wall
 
     def _next_thinking_sound_chunk(self) -> np.ndarray:
         """Next MIMI_FRAME_SIZE samples of the thinking sound, looping
@@ -570,6 +630,11 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         self.stt_in_utterance = False
         self.stt_silence_frame_count = 0
         self.stt_last_vad_end = False
+        # Set by the STT worker thread when it detects end-of-utterance; drained
+        # by the GPU thread in _step(). Same cross-thread handoff pattern as
+        # pending_ref_tokens: the worker never touches turn state or the LM, it
+        # only publishes a finished transcript.
+        self.pending_transcript: tuple[str, list] | None = None
         self.search_turn_epoch = 0
         self.search_ref_committed_this_turn = False
         self.search_awaiting_ref = False
@@ -630,6 +695,41 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         self._thinking_sound_cursor = 0
         self._thinking_sound_started_at = 0.0
         self._thinking_sound_play_count = 0
+        self._rt_frames = 0
+        self._rt_wall_start = 0.0
+        self._rt_last_warn = 0.0
+        # Drop any frames the worker had not consumed yet and re-reset the STT
+        # streams under the lock. super().reset_session() already reset them,
+        # but it did so without the lock and possibly while the worker was
+        # mid-forward, so this is the reset that actually sticks.
+        stt_queue = getattr(self, "_stt_queue", None)
+        if stt_queue is not None:
+            drained = 0
+            while True:
+                try:
+                    stt_queue.get_nowait()
+                    drained += 1
+                except queue.Empty:
+                    break
+            if drained:
+                print(
+                    f"[liveTryPlasticity][STT] dropped {drained} queued frame(s) on session reset",
+                    flush=True,
+                )
+        if getattr(self, "stt_lm_gen", None) is not None:
+            with self._stt_lock:
+                with contextlib.suppress(Exception):
+                    self.stt_lm_gen.reset_streaming()
+                with contextlib.suppress(Exception):
+                    self.stt_mimi.reset_streaming()
+        # Guards the time-to-first-word metric: the model is full-duplex and is
+        # usually still finishing the PREVIOUS answer when a turn boundary
+        # lands, so the first loud frame after _start_turn is not this turn's
+        # reply. Requiring a silent gap first is what makes the number mean
+        # "the assistant started answering" instead of "the assistant was
+        # already talking".
+        self._turn_saw_silence_after_start = False
+        self._turn_first_speech_deadline = 0
 
     def _inject_tokens(self, tokens: list[int]) -> None:
         """Force-feed text tokens via the PUBLIC lm_gen.step() (not the
@@ -644,10 +744,99 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                 input_tokens=self.lm_gen._encode_sine_frame(),
             )
 
-    def _stt_step(self, chunk: torch.Tensor) -> None:
-        """Run the separate STT/VAD submodel one 80ms frame forward (same GPU
-        thread as everything else in _step()); on a detected end-of-utterance,
-        kick off a turn. Never touches self.lm_gen / self.mimi."""
+    def _stt_submit(self, chunk: torch.Tensor) -> None:
+        """GPU thread: hand this 80ms frame to the STT worker. Never blocks.
+
+        `chunk` is freshly allocated by _step() every call and is never mutated
+        afterwards, so it can be handed over by reference -- no copy, no extra
+        device traffic on the critical path.
+
+        On overflow the OLDEST frame is dropped rather than the newest: if STT
+        has fallen behind, the useful thing to keep is the most recent speech.
+        Dropping here degrades transcription only; it must never be allowed to
+        stall the thread that generates audio and video."""
+        if self._stt_queue is None:
+            return
+        try:
+            self._stt_queue.put_nowait(chunk)
+            return
+        except queue.Full:
+            pass
+        with contextlib.suppress(queue.Empty):
+            self._stt_queue.get_nowait()
+        try:
+            self._stt_queue.put_nowait(chunk)
+        except queue.Full:
+            pass
+        self._stt_dropped_frames += 1
+        now = time.perf_counter()
+        if now - self._stt_drop_last_log >= 5.0:
+            self._stt_drop_last_log = now
+            print(
+                f"[liveTryPlasticity][STT] worker is behind: dropped "
+                f"{self._stt_dropped_frames} frames "
+                f"({self._stt_dropped_frames * MIMI_FRAME_SIZE / TARGET_SR:.1f}s of audio) "
+                f"this session. Transcripts may be clipped; the avatar is unaffected.",
+                flush=True,
+            )
+            self.conv_logger.event(
+                "stt_frames_dropped",
+                f"total={self._stt_dropped_frames}",
+                dropped_frames=self._stt_dropped_frames,
+            )
+
+    def _stt_worker_loop(self) -> None:
+        """Dedicated STT thread. Runs on its own CUDA stream so its per-frame
+        device syncs (the VAD score and the token buffer both come back to the
+        host) do not serialize the renderer against PersonaPlex."""
+        stream = None
+        if torch.cuda.is_available():
+            with contextlib.suppress(Exception):
+                stream = torch.cuda.Stream()
+        print(
+            f"[liveTryPlasticity][STT] worker thread started "
+            f"(own CUDA stream={stream is not None})",
+            flush=True,
+        )
+        while not self._stt_stop.is_set():
+            try:
+                chunk = self._stt_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if chunk is None:
+                break
+            try:
+                if stream is not None:
+                    with torch.cuda.stream(stream):
+                        self._stt_forward(chunk)
+                    stream.synchronize()
+                else:
+                    self._stt_forward(chunk)
+            except Exception as e:
+                tb = traceback.format_exc()
+                print(
+                    f"[liveTryPlasticity][STT] worker failed, disabling search for the "
+                    f"rest of this session: {e!r}\n{tb}",
+                    flush=True,
+                )
+                self.conv_logger.error("stt_worker", e, tb)
+                self.sys_logger.component_failed("stt_worker (runtime)", e, tb)
+                self.search_hard_disabled = True
+                break
+        print("[liveTryPlasticity][STT] worker thread stopped", flush=True)
+
+    def _stt_forward(self, chunk: torch.Tensor) -> None:
+        """Run the STT/VAD submodel one 80ms frame forward and, on a detected
+        end-of-utterance, publish the transcript for the GPU thread to act on.
+
+        Runs on the STT worker thread. Touches only STT state plus two plain
+        attributes shared with the GPU thread (`pending_transcript`, written
+        here and read there; `search_awaiting_ref`, the reverse) -- never
+        self.lm_gen, self.mimi, or any turn bookkeeping."""
+        with self._stt_lock:
+            self._stt_forward_locked(chunk)
+
+    def _stt_forward_locked(self, chunk: torch.Tensor) -> None:
         stt_codes = self.stt_mimi.encode(chunk)
         stt_result = self.stt_lm_gen.step_with_extra_heads(stt_codes)
         if stt_result is None:
@@ -690,6 +879,28 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         self.stt_silence_frame_count = 0
         if not transcript.strip():
             return
+        # Reset the STT streams here, on the worker's own thread, so the next
+        # utterance starts clean without the GPU thread ever touching them.
+        with contextlib.suppress(Exception):
+            self.stt_lm_gen.reset_streaming()
+            self.stt_mimi.reset_streaming()
+        # Hand off. Everything below this line runs on the GPU thread, because
+        # it reads audio_text boundaries and starts a turn.
+        self.pending_transcript = (transcript, transcript_token_ids)
+
+    def _consume_pending_transcript(self) -> None:
+        """GPU thread: act on a transcript the STT worker finished.
+
+        This is the second half of the old inline _stt_step -- the half that
+        must stay on the GPU thread because it reads the audio_text boundaries
+        that delimit the previous turn's reply and then starts a new turn."""
+        pending = self.pending_transcript
+        if pending is None:
+            return
+        self.pending_transcript = None
+        transcript, transcript_token_ids = pending
+
+        import search_helpers
 
         # Close out the PREVIOUS turn's response now that we know it finished
         # (the user has started speaking again). Slice between BOTH turn
@@ -765,18 +976,12 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                 f"{len(transcript_token_ids)} tok): {transcript[:120]!r}{hint}",
                 flush=True,
             )
-            with contextlib.suppress(Exception):
-                self.stt_lm_gen.reset_streaming()
-                self.stt_mimi.reset_streaming()
             return
 
         self.conv_logger.turn_heard(
             self.search_turn_epoch + 1, transcript, transcript_token_ids, script_stats
         )
         self.conv_logger.narrate_user_message(self.search_turn_epoch + 1, transcript)
-        with contextlib.suppress(Exception):
-            self.stt_lm_gen.reset_streaming()
-            self.stt_mimi.reset_streaming()
         self._start_turn(transcript)
 
     def _begin_casual_turn(self, transcript: str, reason: str) -> None:
@@ -794,6 +999,10 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         self._turn_start_audio_text_len = len(self.audio_text)
         self._turn_awaiting_first_speech = True
         self._turn_first_speech_epoch = self.search_turn_epoch
+        self._turn_saw_silence_after_start = False
+        # ~4s of frames: long enough for the previous answer to finish, short
+        # enough that the metric is still recorded if it never does.
+        self._turn_first_speech_deadline = self.step + 50
         print(
             f"[liveTryPlasticity][search] no search ({reason}) -- "
             f"answering from the model's own knowledge",
@@ -872,6 +1081,10 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         self._turn_start_audio_text_len = len(self.audio_text)
         self._turn_awaiting_first_speech = True
         self._turn_first_speech_epoch = my_epoch
+        self._turn_saw_silence_after_start = False
+        # ~4s of frames: long enough for the previous answer to finish, short
+        # enough that the metric is still recorded if it never does.
+        self._turn_first_speech_deadline = self.step + 50
         self.conv_logger.record(my_epoch, transcript=transcript)
 
         # The thinking sound is NOT started here for the undecided case. Only
@@ -1274,6 +1487,9 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
     def _step(self, pcm24: np.ndarray) -> dict:
         self.step += 1
         t0 = time.perf_counter()
+        if self._rt_wall_start == 0.0:
+            self._rt_wall_start = t0
+        self._rt_frames += 1
         chunk = torch.from_numpy(pcm24).to(self.device, dtype=torch.float32)[None, None]
 
         t_encode0 = time.perf_counter()
@@ -1298,11 +1514,19 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         if self.stt_lm_gen is not None and not self.search_hard_disabled:
             t_stt0 = time.perf_counter()
             try:
-                self._stt_step(chunk)
+                if self.stt_inline:
+                    # Opt-in A/B path: run the STT model right here, the way it
+                    # used to. Kept only so the threaded path can be compared
+                    # against it; it costs a 1B forward plus two device syncs
+                    # inside this 80ms budget.
+                    self._stt_forward(chunk)
+                else:
+                    self._stt_submit(chunk)
+                self._consume_pending_transcript()
             except Exception as e:
                 tb = traceback.format_exc()
                 print(
-                    f"[liveTryPlasticity][search] _stt_step failed, disabling search "
+                    f"[liveTryPlasticity][search] STT handling failed, disabling search "
                     f"for the rest of this session: {e!r}\n{tb}",
                     flush=True,
                 )
@@ -1386,19 +1610,35 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         # is the ONE number that matches what the user experiences; the SAID
         # line in the conversation log is emitted when the NEXT utterance ends
         # and therefore measures the user's own pause, not the assistant's.
-        if self._turn_awaiting_first_speech and model_own_rms > self._SPEECH_RMS_THRESHOLD:
-            self._turn_awaiting_first_speech = False
-            started = self._turn_timing_start
-            if started is not None:
-                first_word_s = time.perf_counter() - started
-                self.conv_logger.turn_spoke(
-                    self._turn_first_speech_epoch, first_word_s, self.input_backlog_sec(),
-                )
-                self.conv_logger.record(
-                    self._turn_first_speech_epoch,
-                    first_word_s=round(first_word_s, 3),
-                    input_backlog_s=round(self.input_backlog_sec(), 3),
-                )
+        if self._turn_awaiting_first_speech:
+            quiet = model_own_rms <= self._SPEECH_RMS_THRESHOLD
+            if quiet:
+                self._turn_saw_silence_after_start = True
+            # Accept the first loud frame only once the model has actually gone
+            # quiet since the turn started -- otherwise this measures the tail of
+            # the PREVIOUS answer and always reports ~0.03s. The deadline is the
+            # escape hatch for a model that never pauses: past it, the number is
+            # still recorded but flagged approximate rather than lost.
+            past_deadline = (
+                self._turn_first_speech_deadline
+                and self.step >= self._turn_first_speech_deadline
+            )
+            if not quiet and (self._turn_saw_silence_after_start or past_deadline):
+                self._turn_awaiting_first_speech = False
+                started = self._turn_timing_start
+                if started is not None:
+                    first_word_s = time.perf_counter() - started
+                    self.conv_logger.turn_spoke(
+                        self._turn_first_speech_epoch, first_word_s, self.input_backlog_sec(),
+                    )
+                    self.conv_logger.record(
+                        self._turn_first_speech_epoch,
+                        first_word_s=round(first_word_s, 3),
+                        first_word_approximate=bool(past_deadline
+                                                    and not self._turn_saw_silence_after_start),
+                        input_backlog_s=round(self.input_backlog_sec(), 3),
+                        realtime_factor=round(self.realtime_factor(), 3),
+                    )
 
         # "Thinking sound": while an online search is in flight, replace what
         # the model would otherwise output with the looped clip. The model
@@ -1432,9 +1672,40 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             f"in_rms={input_rms:.5f} reply_rms={reply_rms:.5f} peak={reply_peak:.3f} "
             f"hidden={helium_hidden is not None} "
             f"encode={encode_ms:.1f}ms lm={lm_ms:.1f}ms stt={stt_ms:.1f}ms "
-            f"decode={decode_ms:.1f}ms total={total_ms:.1f}ms",
+            f"decode={decode_ms:.1f}ms total={total_ms:.1f}ms rtf={self.realtime_factor():.2f}",
             flush=True,
         )
+
+        # Real-time watchdog. A sustained rtf below 1.0 is the one condition
+        # under which this pipeline goes SILENT rather than merely slow: the
+        # audio sender paces on a fixed 80ms grid, so a producer that cannot
+        # supply 80ms of audio per 80ms of wall clock leaves the browser's
+        # decoder permanently under-run. Say so explicitly, because the symptom
+        # ("no sound at all") looks nothing like the cause ("GPU 20% too slow").
+        if self.step % 125 == 0:
+            rtf = self.realtime_factor()
+            now = time.perf_counter()
+            if rtf < 0.98 and now - self._rt_last_warn >= 10.0:
+                self._rt_last_warn = now
+                print(
+                    f"[liveTryPlasticity] WARNING real-time factor {rtf:.2f} -- the model "
+                    f"pipeline is consuming only {rtf:.2f}s of audio per second of wall clock. "
+                    f"Below 1.0 the audio sender starves and the avatar will sound broken or "
+                    f"silent. Reduce per-step GPU cost: merge the reference LoRA "
+                    f"(--merge_ref_lora), move the router/compressor off this GPU "
+                    f"(--compressor_device cpu), or launch with ENABLE_SEARCH=0.",
+                    flush=True,
+                )
+                self.conv_logger.event(
+                    "realtime_factor_low", f"rtf={rtf:.3f}",
+                    realtime_factor=round(rtf, 3),
+                    stt_dropped_frames=self._stt_dropped_frames,
+                )
+                self.sys_logger.event(
+                    "realtime_factor_low",
+                    f"rtf={rtf:.2f} -- producer is below real time; audio will starve",
+                    realtime_factor=round(rtf, 3),
+                )
 
         return {
             "step": int(self.step),
@@ -1451,6 +1722,7 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             "encode_ms": encode_ms,
             "lm_ms": lm_ms,
             "stt_ms": stt_ms,
+            "realtime_factor": self.realtime_factor(),
             "decode_ms": decode_ms,
             "total_ms": total_ms,
             "helium_hidden": helium_hidden,
@@ -2849,7 +3121,18 @@ class LiveHeliumFMOptions(BaseOptions):
         # this script's plain conversational behaviour exactly, with no extra
         # model loaded and no per-chunk cost.
         parser.add_argument("--ref_lora_dir", default="", help="Dir containing lora/ with the <lookup>/<ref> context-injection LoRA adapter")
-        parser.add_argument("--merge_ref_lora", action="store_true", help="Merge the reference LoRA into base weights instead of keeping it unmerged (QLoRA-style; default is unmerged)")
+        parser.add_argument(
+            "--merge_ref_lora", action=argparse.BooleanOptionalAction, default=True,
+            help="Fold the reference LoRA into the base weights at startup (default). This "
+                 "adapter targets nearly every projection in the 7B model at r=128, so leaving it "
+                 "UNMERGED costs two extra matmuls per layer on every one of the 12.5 model steps "
+                 "per second, for the whole session -- not just on turns that use search. That is "
+                 "enough to push this pipeline below real time, and below real time the "
+                 "fixed-cadence audio sender starves and the avatar goes silent rather than "
+                 "merely slow. Use --no-merge_ref_lora only to compare numerics; if merging is "
+                 "unsupported by the installed peft/bitsandbytes it falls back to unmerged and "
+                 "says so loudly.",
+        )
         parser.add_argument("--max_ref_tokens", type=int, default=250, help="Cap on injected <ref> block length, in tokens")
         parser.add_argument(
             "--router_threshold", type=float, default=0.40,
@@ -2879,10 +3162,23 @@ class LiveHeliumFMOptions(BaseOptions):
                  "or injecting them. Search engines always return something, so this floor is the "
                  "only thing between an unrelated page and the assistant's spoken answer.",
         )
+        parser.add_argument(
+            "--stt_inline", action="store_true",
+            help="Run the STT/VAD forward pass inline on the GPU thread instead of on its own "
+                 "thread. Diagnostic only. Inline costs a 1B model forward plus two device syncs "
+                 "inside every 80ms step, which is what pushed this pipeline below real time and "
+                 "silenced the avatar; the threaded default keeps that off the critical path.",
+        )
+        parser.add_argument(
+            "--stt_queue_frames", type=int, default=64,
+            help="Frames buffered for the STT worker (64 = ~5s of audio). On overflow the OLDEST "
+                 "frame is dropped and the drop is logged: STT falling behind must degrade "
+                 "transcription, never stall audio and video generation.",
+        )
         parser.add_argument("--stt_hf_repo", default="", help="HF repo for the STT/VAD submodel, e.g. kyutai/stt-1b-en_fr-candle. Omit to disable routing/search entirely (no transcript, no turn-detection signal).")
         parser.add_argument("--stt_pkg_dir", default="", help="Dir containing an isolated `pip install --no-deps --target <dir> moshi` install of the upstream Kyutai moshi package")
         parser.add_argument(
-            "--max_input_buffer_sec", type=float, default=2.0,
+            "--max_input_buffer_sec", type=float, default=6.0,
             help="Maximum seconds of unprocessed microphone audio to keep. THE most important "
                  "latency control in this server: the GPU producer is rate-limited to exactly real "
                  "time by frame_q backpressure, so it can never drain a backlog. Without this cap "
@@ -3098,6 +3394,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
         "output_audio_codec", "enable_eye_blink_composite", "blink_motion_path",
         "ref_lora_dir", "merge_ref_lora", "max_ref_tokens", "stt_hf_repo", "stt_pkg_dir",
         "compressor_model", "compressor_device", "compressor_4bit", "router_threshold",
+        "stt_inline", "stt_queue_frames",
         "router_rules", "web_search_enabled", "web_search_api_key", "web_search_provider",
         "web_search_max_results", "web_search_timeout", "web_search_min_score",
         "search_max_filler_sec", "thinking_sound_path", "conversation_log_dir",
@@ -3190,7 +3487,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                 voice_prompt_dir=getattr(args, "voice_prompt_dir", ""),
                 text_prompt=getattr(args, "text_prompt", ""),
                 ref_lora_dir=getattr(args, "ref_lora_dir", ""),
-                merge_ref_lora=bool(getattr(args, "merge_ref_lora", False)),
+                merge_ref_lora=bool(getattr(args, "merge_ref_lora", True)),
                 max_ref_tokens=int(getattr(args, "max_ref_tokens", 250)),
                 router_threshold=float(getattr(args, "router_threshold", 0.40)),
                 router_use_rules=bool(int(getattr(args, "router_rules", 1))),
@@ -3216,6 +3513,8 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                 conversation_log_dir=getattr(args, "conversation_log_dir", ""),
                 thinking_sound_path=getattr(args, "thinking_sound_path", ""),
                 search_max_filler_sec=float(getattr(args, "search_max_filler_sec", 6.0)),
+                stt_inline=bool(getattr(args, "stt_inline", False)),
+                stt_queue_frames=int(getattr(args, "stt_queue_frames", 64)),
             )
         return moshi_engine
 
@@ -4059,6 +4358,10 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                                 "chunk": reply_avatar_chunk_idx,
                                 "frame_q_depth": q_depth,
                                 "input_backlog_s": round(backlog_s, 2),
+                                "realtime_factor": round(reply_engine.realtime_factor(), 3),
+                                "stt_dropped_frames": int(
+                                    getattr(reply_engine, "_stt_dropped_frames", 0)
+                                ),
                                 "input_dropped_s": round(
                                     reply_engine._input_dropped_samples / TARGET_SR, 2
                                 ),

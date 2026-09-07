@@ -53,7 +53,10 @@ LOG_DIR="${LOG_DIR:-$ROOT/logs}"
 # That is how a pipeline whose floor is ~2-4s ends up answering 10-12s late.
 # With the cap, the oldest audio is dropped (and the drop logged) so the delay
 # is bounded no matter what happens. Set 0 for the old unbounded behaviour.
-MAX_INPUT_BUFFER_SEC="${MAX_INPUT_BUFFER_SEC:-2.0}"
+# 6.0s = three generation chunks. 2.0s was one chunk, which is too tight: a
+# single chunk-boundary stall then starts destroying speech instead of absorbing
+# the hiccup. Raise it further to trade latency for completeness.
+MAX_INPUT_BUFFER_SEC="${MAX_INPUT_BUFFER_SEC:-6.0}"
 # 50 frames / 10 = 5 exact sub-batches, so the renderer never pads a short tail
 # and pays fewer Python round-trips than the previous 6. Same output frames,
 # less wall time on the reply path. Lower it if the GPU is short on VRAM.
@@ -140,7 +143,22 @@ if [[ "$ENABLE_SEARCH" == "1" ]]; then
     # only thing between an unrelated page and the assistant's spoken answer.
     --web_search_min_score "${WEB_SEARCH_MIN_SCORE:-0.15}"
     --max_ref_tokens "${MAX_REF_TOKENS:-250}"
+    # STT/VAD runs on its own thread and CUDA stream. Inline (the old placement)
+    # put a 1B forward plus two device syncs inside the 80ms real-time budget
+    # of the thread that also runs the 7B model and the renderer, which pushed
+    # the producer below real time and silenced the avatar. Set STT_INLINE=1
+    # only to reproduce that for comparison.
+    --stt_queue_frames "${STT_QUEUE_FRAMES:-64}"
   )
+  [[ "${STT_INLINE:-0}" == "1" ]] && SEARCH_ARGS+=(--stt_inline)
+  # The reference LoRA is folded into the base weights by default. Unmerged it
+  # costs extra matmuls on nearly every projection of a 7B model on EVERY step,
+  # which this pipeline cannot afford. MERGE_REF_LORA=0 disables the fold.
+  if [[ "${MERGE_REF_LORA:-1}" == "1" ]]; then
+    SEARCH_ARGS+=(--merge_ref_lora)
+  else
+    SEARCH_ARGS+=(--no-merge_ref_lora)
+  fi
   # Web search is what "needs live data" resolves to, so default it ON whenever
   # a key is available. Without a key the router still runs and still decides --
   # turns that need live data just fall back to the model's own knowledge.
@@ -239,6 +257,9 @@ echo "Preflight OK: try_vad2, $VOICE_PROMPT, prompt cache=$PROMPT_CACHE, 2.0s/25
 echo "  logs=${LOG_DIR:-<console only>}  max_input_buffer=${MAX_INPUT_BUFFER_SEC}s  jpeg_q=$JPEG_QUALITY  prebuffer=$PREBUFFER_CHUNKS  incremental_publish=$INCREMENTAL_PUBLISH"
 if [[ "$ENABLE_SEARCH" == "1" ]]; then
   echo "  search=ON ref_lora=$REF_LORA_DIR stt_pkg=$STT_PKG_DIR web_search=${WEB_SEARCH_ENABLED} provider=${WEB_SEARCH_PROVIDER:-tavily} router_threshold=${ROUTER_THRESHOLD:-0.40} thinking_sound=$THINKING_SOUND_PATH"
+  echo "  merge_ref_lora=${MERGE_REF_LORA:-1} stt_inline=${STT_INLINE:-0} stt_queue_frames=${STT_QUEUE_FRAMES:-64} compressor_device=${COMPRESSOR_DEVICE:-cuda}"
+  echo "  NOTE watch the rtf= value on the [liveTryStudio] lines. Below 1.00 the model"
+  echo "       pipeline cannot keep up with real time and the avatar audio will starve."
 else
   echo "  search=OFF (set ENABLE_SEARCH=1 with WEB_SEARCH_API_KEY to enable online search)"
 fi

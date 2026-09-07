@@ -173,7 +173,7 @@ class MoshiOnlyEngine:
         # Identical surface to liveTry.MoshiOnlyEngine, so the caller does not
         # have to know which engine the PROMPT_CACHE switch selected.
         ref_lora_dir: str = "",
-        merge_ref_lora: bool = False,
+        merge_ref_lora: bool = True,
         max_ref_tokens: int = 250,
         stt_hf_repo: str = "",
         stt_pkg_dir: str = "",
@@ -183,7 +183,7 @@ class MoshiOnlyEngine:
         stt_reject_foreign_script: bool = True,
         stt_max_non_latin_ratio: float = 0.15,
         stt_require_english: bool = True,
-        max_input_buffer_sec: float = 2.0,
+        max_input_buffer_sec: float = 6.0,
         compressor_model: str = "",
         compressor_device: str = "cuda",
         compressor_4bit: bool = True,

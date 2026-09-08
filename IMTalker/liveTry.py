@@ -500,6 +500,9 @@ class MoshiOnlyEngine:
                     "as transcripts in a language the en/fr STT model cannot actually produce.",
                     flush=True,
                 )
+            # MUST happen here, before the server starts any producer/renderer
+            # thread. See _warmup_stt for why.
+            self._warmup_stt(moshi_stt)
             self.conv_logger.event(
                 "stt_loaded", stt_repo=stt_hf_repo, stt_tokenizer=stt_desc,
                 main_tokenizer=main_desc, padding_token_id=self.stt_padding_token_id,
@@ -509,6 +512,132 @@ class MoshiOnlyEngine:
             print(f"[liveTry] search disabled -- STT model load failed: {e!r}\n{tb}", flush=True)
             self.conv_logger.error("stt_load", e, tb)
             self.sys_logger.component_failed("stt_vad", e, tb)
+            self.stt_mimi = None
+            self.stt_lm_gen = None
+
+    @torch.no_grad()
+    def _warmup_stt(self, moshi_stt, n_steps: int = 4) -> None:
+        """Force the STT submodel's CUDA graphs to capture NOW, while this is
+        still the only thread issuing CUDA work.
+
+        moshi wraps the Mimi encoder and the LM in `CUDAGraphed`, which captures
+        LAZILY -- on the second call, since warmup_steps defaults to 1 -- and
+        `torch.cuda.graph()` captures with capture_error_mode "global": any CUDA
+        work submitted by ANY other thread inside the capture window aborts it.
+
+        With STT on its own worker thread, its first real frame only arrives
+        once the browser starts streaming audio, by which point the renderer and
+        the PersonaPlex producer threads are both busy. That window is never
+        quiet, so capture reliably failed with
+
+            cuDNN error: CUDNN_STATUS_INTERNAL_ERROR
+            CUDA error: operation failed due to a previous error during capture
+
+        and took STT (and therefore search) down with it. Capturing here means
+        the worker only ever REPLAYS, which is stream-ordered and thread-safe.
+        `reset_streaming()` between utterances does not invalidate the graphs --
+        `_MimiState.reset()` is a no-op -- so this runs exactly once.
+
+        `n_steps` is 4 rather than 2 so every graphed callable gets past its own
+        warmup_steps: the Mimi encoder, the LM's main transformer, and the
+        depformer all capture on different calls."""
+        if str(self.device) == "cpu" or not torch.cuda.is_available():
+            return
+
+        silence = torch.zeros(1, 1, FRAME_SIZE, device=self.device, dtype=torch.float32)
+
+        def _run(steps: int) -> None:
+            for _ in range(steps):
+                codes = self.stt_mimi.encode(silence)
+                self.stt_lm_gen.step_with_extra_heads(codes)
+
+        def _reset() -> None:
+            with contextlib.suppress(Exception):
+                self.stt_lm_gen.reset_streaming()
+            with contextlib.suppress(Exception):
+                self.stt_mimi.reset_streaming()
+
+        t0 = time.perf_counter()
+        try:
+            _run(n_steps)
+            torch.cuda.synchronize()
+            _reset()
+            elapsed = time.perf_counter() - t0
+            print(
+                f"[liveTry] STT CUDA graphs captured in {elapsed:.2f}s "
+                f"({n_steps} warmup steps, single-threaded)",
+                flush=True,
+            )
+            self.sys_logger.event(
+                "stt_cuda_graphs",
+                f"captured at startup in {elapsed:.2f}s -- the STT worker thread will only "
+                f"replay them, which is what keeps capture off a busy multi-threaded window",
+                warmup_steps=n_steps, elapsed_s=round(elapsed, 3), cuda_graphs=True,
+            )
+            return
+        except Exception as e:
+            tb = traceback.format_exc()
+            print(
+                f"[liveTry] STT CUDA graph warmup failed ({e!r}); retrying with CUDA "
+                f"graphs disabled for the STT model only.\n{tb}",
+                flush=True,
+            )
+            self.conv_logger.error("stt_warmup", e, tb)
+
+        # Fallback: disable CUDA graphs for the ISOLATED STT package only. This
+        # is why the upstream package is loaded under its own module alias --
+        # `_disable_cuda_graph` is a module-level global, so setting it here
+        # cannot touch PersonaPlex's own graphs, which are load-bearing for
+        # real-time performance. Setting the NO_CUDA_GRAPH env var instead would
+        # disable both and cripple the main model.
+        disabled = False
+        compile_mod = sys.modules.get("moshi_stt.utils.compile")
+        if compile_mod is None:
+            with contextlib.suppress(Exception):
+                compile_mod = moshi_stt.utils.compile
+        if compile_mod is not None:
+            with contextlib.suppress(Exception):
+                compile_mod._disable_cuda_graph = True
+                disabled = True
+        if not disabled:
+            print(
+                "[liveTry] could not reach the STT package's CUDA-graph switch; "
+                "disabling STT so a capture failure cannot take the avatar with it.",
+                flush=True,
+            )
+            self.sys_logger.event(
+                "stt_cuda_graphs",
+                "warmup failed and the graph switch was unreachable -- STT disabled",
+                cuda_graphs=None, stt_disabled=True,
+            )
+            self.stt_mimi = None
+            self.stt_lm_gen = None
+            return
+
+        _reset()
+        try:
+            _run(2)
+            torch.cuda.synchronize()
+            _reset()
+            print(
+                "[liveTry] STT running WITHOUT CUDA graphs (slower per frame, but it is on "
+                "its own thread and has a multi-second queue, so it still keeps up).",
+                flush=True,
+            )
+            self.sys_logger.event(
+                "stt_cuda_graphs",
+                "capture failed; STT runs without CUDA graphs (isolated to the STT package)",
+                cuda_graphs=False,
+            )
+        except Exception as e:
+            tb = traceback.format_exc()
+            print(
+                f"[liveTry] STT still failing without CUDA graphs ({e!r}) -- disabling STT. "
+                f"The avatar keeps working; online search is off for this run.\n{tb}",
+                flush=True,
+            )
+            self.conv_logger.error("stt_warmup_nograph", e, tb)
+            self.sys_logger.component_failed("stt_vad (warmup)", e, tb)
             self.stt_mimi = None
             self.stt_lm_gen = None
 

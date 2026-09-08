@@ -290,23 +290,9 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
 
         self._install_graph_hidden_capture()
 
-        # The STT worker starts last: the STT submodel is loaded at the very end
-        # of the base constructor, so nothing before this point could feed it.
-        if self.stt_lm_gen is not None and not self.stt_inline:
-            self._stt_queue = queue.Queue(maxsize=max(8, int(stt_queue_frames)))
-            self._stt_thread = threading.Thread(
-                target=self._stt_worker_loop, name="stt-vad", daemon=True
-            )
-            self._stt_thread.start()
-            self.sys_logger.event(
-                "stt_worker",
-                f"STT/VAD runs on its own thread and CUDA stream "
-                f"(queue={self._stt_queue.maxsize} frames = "
-                f"{self._stt_queue.maxsize * MIMI_FRAME_SIZE / TARGET_SR:.1f}s of audio). "
-                f"Keeps a 1B forward and two device syncs off the 80ms real-time budget.",
-                queue_frames=self._stt_queue.maxsize, inline=False,
-            )
-        elif self.stt_lm_gen is not None:
+        # The worker is NOT started here. See start_stt_worker().
+        self._stt_queue_frames = max(8, int(stt_queue_frames))
+        if self.stt_lm_gen is not None and self.stt_inline:
             print(
                 "[liveTryPlasticity][STT] running INLINE on the GPU thread "
                 "(--stt_inline): expect a 1B forward plus two device syncs inside "
@@ -314,6 +300,39 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                 flush=True,
             )
             self.sys_logger.event("stt_worker", "STT/VAD runs INLINE on the GPU thread", inline=True)
+
+    def start_stt_worker(self) -> None:
+        """Start the STT worker thread. Idempotent; safe to call per session.
+
+        Deliberately NOT called from __init__. CUDA graph capture is exclusive
+        process-wide -- capture_error_mode is "global", so work submitted by any
+        other thread inside the capture window aborts it. The STT graphs are
+        captured during single-threaded construction (see _warmup_stt), but the
+        FM/renderer engine is constructed lazily on the first websocket
+        connection and does its own warmup then. Starting the worker only after
+        that point means no background thread is ever running while another
+        component is capturing, which removes the whole class of race instead
+        of the one instance that was observed."""
+        if self.stt_lm_gen is None or self.stt_inline:
+            return
+        if self._stt_thread is not None and self._stt_thread.is_alive():
+            return
+        if self.search_hard_disabled:
+            return
+        self._stt_queue = queue.Queue(maxsize=self._stt_queue_frames)
+        self._stt_stop.clear()
+        self._stt_thread = threading.Thread(
+            target=self._stt_worker_loop, name="stt-vad", daemon=True
+        )
+        self._stt_thread.start()
+        self.sys_logger.event(
+            "stt_worker",
+            f"STT/VAD worker started on its own thread and CUDA stream "
+            f"(queue={self._stt_queue_frames} frames = "
+            f"{self._stt_queue_frames * MIMI_FRAME_SIZE / TARGET_SR:.1f}s of audio). "
+            f"Keeps a 1B forward and two device syncs off the 80ms real-time budget.",
+            queue_frames=self._stt_queue_frames, inline=False,
+        )
 
     def realtime_factor(self) -> float:
         """Audio seconds consumed per wall second, since the session started.
@@ -3670,6 +3689,11 @@ def build_app(args: argparse.Namespace) -> FastAPI:
         if seedvc is not None:
             seedvc.reset()
         reply_engine = get_moshi_engine() if args.enable_moshi_reply else None
+        if reply_engine is not None:
+            # Safe to start now: get_engine() above has finished the FM/renderer
+            # warmup, so nothing else in this process is capturing CUDA graphs.
+            with contextlib.suppress(Exception):
+                reply_engine.start_stt_worker()
         # PersonaPlex is reset exactly once at the Start boundary below. Doing
         # it here as well replays uncached prompts twice for every connection.
         browser_input_sr = 48000

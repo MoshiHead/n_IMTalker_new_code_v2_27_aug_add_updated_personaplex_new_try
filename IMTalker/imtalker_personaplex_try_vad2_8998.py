@@ -1771,6 +1771,39 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
 # Utilities
 # ---------------------------------------------------------------------------
 
+def _supervise(name: str, fn, on_error=None):
+    """Wrap a long-lived thread body so a crash is LOUD and lands in both logs.
+
+    Every media thread here is a daemon started with threading.Thread(target=...).
+    Python's default behaviour on an uncaught exception in such a thread is to
+    print a traceback to stderr and let the thread die silently. For the GPU
+    producer that means audio and video stop forever while the persona, STT and
+    search threads keep running -- so the conversation log continues to look
+    completely healthy and the only evidence is a traceback in a file nobody
+    thinks to check. Both structured logs must record a thread death, because
+    "the avatar went quiet" and "a thread died" have to be connectable."""
+
+    def _runner():
+        try:
+            fn()
+        except BaseException as e:  # noqa: BLE001 - a dying thread must be reported
+            tb = traceback.format_exc()
+            print(f"[THREAD-DIED] {name}: {e!r}\n{tb}", flush=True)
+            with contextlib.suppress(Exception):
+                system_logger.get().component_failed(f"thread:{name}", e, tb)
+            if on_error is not None:
+                with contextlib.suppress(Exception):
+                    on_error(e, tb)
+        else:
+            print(f"[THREAD-EXIT] {name} returned normally", flush=True)
+            with contextlib.suppress(Exception):
+                system_logger.get().event(
+                    "thread_exit", f"{name} returned normally", thread=name
+                )
+
+    return _runner
+
+
 def _sync_cuda() -> None:
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -3141,16 +3174,14 @@ class LiveHeliumFMOptions(BaseOptions):
         # model loaded and no per-chunk cost.
         parser.add_argument("--ref_lora_dir", default="", help="Dir containing lora/ with the <lookup>/<ref> context-injection LoRA adapter")
         parser.add_argument(
-            "--merge_ref_lora", action=argparse.BooleanOptionalAction, default=True,
-            help="Fold the reference LoRA into the base weights at startup (default). This "
-                 "adapter targets nearly every projection in the 7B model at r=128, so leaving it "
-                 "UNMERGED costs two extra matmuls per layer on every one of the 12.5 model steps "
-                 "per second, for the whole session -- not just on turns that use search. That is "
-                 "enough to push this pipeline below real time, and below real time the "
-                 "fixed-cadence audio sender starves and the avatar goes silent rather than "
-                 "merely slow. Use --no-merge_ref_lora only to compare numerics; if merging is "
-                 "unsupported by the installed peft/bitsandbytes it falls back to unmerged and "
-                 "says so loudly.",
+            "--merge_ref_lora", action=argparse.BooleanOptionalAction, default=False,
+            help="Fold the reference LoRA into the base weights at startup. DEFAULT OFF, which "
+                 "matches the old pipeline: it runs this adapter unmerged (QLoRA-style, computed "
+                 "at forward time on top of the 4-bit base) and holds real time comfortably on the "
+                 "same GPU, so unmerged is a proven configuration and not a performance problem. "
+                 "Merging is also not currently possible against a bnb-4bit base -- peft attempts "
+                 "`base_layer.weight.data += delta_weight` against the PACKED quantized blob and "
+                 "raises a shape mismatch -- so enabling this just takes the loud fallback path.",
         )
         parser.add_argument("--max_ref_tokens", type=int, default=250, help="Cap on injected <ref> block length, in tokens")
         parser.add_argument(
@@ -3506,7 +3537,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                 voice_prompt_dir=getattr(args, "voice_prompt_dir", ""),
                 text_prompt=getattr(args, "text_prompt", ""),
                 ref_lora_dir=getattr(args, "ref_lora_dir", ""),
-                merge_ref_lora=bool(getattr(args, "merge_ref_lora", True)),
+                merge_ref_lora=bool(getattr(args, "merge_ref_lora", False)),
                 max_ref_tokens=int(getattr(args, "max_ref_tokens", 250)),
                 router_threshold=float(getattr(args, "router_threshold", 0.40)),
                 router_use_rules=bool(int(getattr(args, "router_rules", 1))),
@@ -3850,6 +3881,16 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                     async with ws_send_lock:
                         await ws.send_json({"type":"media_reset","generation":generation,"reason":"native_personaplex_barge_in"})
                     print(f"[MEDIA-RESET] generation={generation} dropped_audio={dropped_audio} dropped_frames={dropped_frames}", flush=True)
+                    with contextlib.suppress(Exception):
+                        sys_log.event(
+                            "media_reset",
+                            f"generation={generation} dropped_audio={dropped_audio} "
+                            f"dropped_frames={dropped_frames} -- the GPU producer's partial "
+                            f"chunk buffer is cleared by this; repeated resets can prevent a "
+                            f"chunk ever completing",
+                            generation=generation, dropped_audio=dropped_audio,
+                            dropped_frames=dropped_frames,
+                        )
 
                 def _trigger_media_reset() -> int:
                     with media_generation_lock:
@@ -3888,6 +3929,16 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                                 f"reply_rms={reply_rms:.5f}",
                                 flush=True,
                             )
+                            with contextlib.suppress(Exception):
+                                sys_log.event(
+                                    "playback_barge_in",
+                                    f"generation={generation} input_rms={input_rms:.5f} "
+                                    f"reply_rms={reply_rms:.5f} -- media suppressed until the "
+                                    f"model goes silent and starts a fresh reply",
+                                    generation=generation,
+                                    input_rms=round(input_rms, 5),
+                                    reply_rms=round(reply_rms, 5),
+                                )
 
                         if suppress_media:
                             if not suppression_silence_confirmed:
@@ -4002,6 +4053,14 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                         )
                     except Exception as e:
                         print(f"[GPU] WARNING audio_q.put failed: {e!r}", flush=True)
+
+                sys_log.event(
+                    "gpu_producer_started",
+                    f"steps/chunk={hidden_steps_per_chunk} frames/chunk={int(args.fm_chunk_frames)} "
+                    f"sub_batch={fm_engine.render_sub_batch} backpressure={FRAME_Q_BACKPRESS}",
+                    hidden_steps_per_chunk=hidden_steps_per_chunk,
+                    incremental_publish=incremental_publish,
+                )
 
                 if prebuffer_chunks <= 0 and not prebuffer_ready.is_set():
                     prebuffer_ready.set()
@@ -4330,11 +4389,25 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                             staged_frames.extend(packets)
 
                         if not incremental_publish:
-                            # Atomic publication (default): do not let speech
-                            # escape before all matching frames are ready. This
-                            # intentionally holds one whole generation chunk to
-                            # preserve A/V sync.
-                            _publish(staged_frames, n_frames)
+                            # Atomic publication (default). Deliberately kept as
+                            # the original straight-line code rather than routed
+                            # through _publish: this is the proven path, and the
+                            # default must not depend on the correctness of the
+                            # opt-in one. Do not let speech escape before all
+                            # matching frames are ready -- this intentionally
+                            # holds one whole generation chunk to preserve A/V
+                            # sync. Frames go first so the browser has the
+                            # complete visual reserve before audio advances its
+                            # playback clock.
+                            for pkt in staged_frames:
+                                _enqueue_frame(pkt)
+                            for audio_step in used_audio:
+                                _enqueue_audio({
+                                    "audio_packet_index": staged_audio_seq,
+                                    "audio_pcm": np.asarray(audio_step, dtype=np.float32).copy(),
+                                    "created_at": time.perf_counter(),
+                                })
+                                staged_audio_seq += 1
 
                         if not prebuffer_ready.is_set():
                             prebuffer_ready.set()
@@ -4363,7 +4436,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                             flush=True,
                         )
 
-                        if reply_avatar_chunk_idx % 25 == 0:
+                        if reply_avatar_chunk_idx <= 3 or reply_avatar_chunk_idx % 25 == 0:
                             # Microphone backlog is the single best predictor of
                             # perceived reply delay: the producer is pinned to real
                             # time by frame_q backpressure, so a backlog here is a
@@ -4617,19 +4690,35 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                             flush=True,
                         )
 
+            def _report_thread_death(kind: str):
+                def _cb(exc, tb):
+                    with contextlib.suppress(Exception):
+                        reply_engine.conv_logger.error(f"thread_{kind}", exc, tb)
+                return _cb
+
             mic_ingest_thread = threading.Thread(
-                target=_mic_ingest_worker,
+                target=_supervise(
+                    "mic-ingest", _mic_ingest_worker, _report_thread_death("mic_ingest")
+                ),
                 daemon=True,
                 name="mic-ingest",
             )
             mic_ingest_thread.start()
             persona_thread = threading.Thread(
-                target=_persona_priority_worker,
+                target=_supervise(
+                    "persona-priority", _persona_priority_worker,
+                    _report_thread_death("persona_priority"),
+                ),
                 daemon=True,
                 name="persona-priority",
             )
             persona_thread.start()
-            gpu_thread = threading.Thread(target=_gpu_producer_thread, daemon=True, name="gpu-producer")
+            gpu_thread = threading.Thread(
+                target=_supervise(
+                    "gpu-producer", _gpu_producer_thread, _report_thread_death("gpu_producer")
+                ),
+                daemon=True, name="gpu-producer",
+            )
             gpu_thread.start()
             print(
                 f"[AJ][AUDIO] session={session_id[:8]} "

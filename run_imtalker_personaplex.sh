@@ -151,10 +151,12 @@ if [[ "$ENABLE_SEARCH" == "1" ]]; then
     --stt_queue_frames "${STT_QUEUE_FRAMES:-64}"
   )
   [[ "${STT_INLINE:-0}" == "1" ]] && SEARCH_ARGS+=(--stt_inline)
-  # The reference LoRA is folded into the base weights by default. Unmerged it
-  # costs extra matmuls on nearly every projection of a 7B model on EVERY step,
-  # which this pipeline cannot afford. MERGE_REF_LORA=0 disables the fold.
-  if [[ "${MERGE_REF_LORA:-1}" == "1" ]]; then
+  # The reference LoRA runs UNMERGED, exactly as the old pipeline does -- it
+  # ships the same adapter with merge disabled and holds real time on the same
+  # GPU. Merging is also impossible against a bnb-4bit base (peft adds a dense
+  # delta to a packed quantized blob and raises a shape mismatch), so
+  # MERGE_REF_LORA=1 only takes the loud fallback path and ends up unmerged.
+  if [[ "${MERGE_REF_LORA:-0}" == "1" ]]; then
     SEARCH_ARGS+=(--merge_ref_lora)
   else
     SEARCH_ARGS+=(--no-merge_ref_lora)
@@ -257,7 +259,7 @@ echo "Preflight OK: try_vad2, $VOICE_PROMPT, prompt cache=$PROMPT_CACHE, 2.0s/25
 echo "  logs=${LOG_DIR:-<console only>}  max_input_buffer=${MAX_INPUT_BUFFER_SEC}s  jpeg_q=$JPEG_QUALITY  prebuffer=$PREBUFFER_CHUNKS  incremental_publish=$INCREMENTAL_PUBLISH"
 if [[ "$ENABLE_SEARCH" == "1" ]]; then
   echo "  search=ON ref_lora=$REF_LORA_DIR stt_pkg=$STT_PKG_DIR web_search=${WEB_SEARCH_ENABLED} provider=${WEB_SEARCH_PROVIDER:-tavily} router_threshold=${ROUTER_THRESHOLD:-0.40} thinking_sound=$THINKING_SOUND_PATH"
-  echo "  merge_ref_lora=${MERGE_REF_LORA:-1} stt_inline=${STT_INLINE:-0} stt_queue_frames=${STT_QUEUE_FRAMES:-64} compressor_device=${COMPRESSOR_DEVICE:-cuda}"
+  echo "  merge_ref_lora=${MERGE_REF_LORA:-0} stt_inline=${STT_INLINE:-0} stt_queue_frames=${STT_QUEUE_FRAMES:-64} compressor_device=${COMPRESSOR_DEVICE:-cuda}"
   echo "  NOTE watch the rtf= value on the [liveTryStudio] lines. Below 1.00 the model"
   echo "       pipeline cannot keep up with real time and the avatar audio will starve."
 else

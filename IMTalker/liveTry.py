@@ -95,7 +95,7 @@ class MoshiOnlyEngine:
         text_prompt: str = "",
         # --- STT + query routing + web search (all optional, off by default) ---
         ref_lora_dir: str = "",
-        merge_ref_lora: bool = True,
+        merge_ref_lora: bool = False,
         max_ref_tokens: int = 250,
         stt_hf_repo: str = "",
         stt_pkg_dir: str = "",
@@ -350,29 +350,26 @@ class MoshiOnlyEngine:
             )
         self.sys_logger.gpu_memory("after all reply-engine components")
 
-    def _load_ref_lora(self, checkpoint_dir: str, merge_lora: bool = True) -> None:
+    def _load_ref_lora(self, checkpoint_dir: str, merge_lora: bool = False) -> None:
         """Load the <lookup>/<ref> LoRA adapter onto self.lm.
 
-        MERGED by default, and that default matters a great deal here.
+        UNMERGED by default -- QLoRA-style, computed at forward time on top of
+        the 4-bit base rather than folded into it. This matches the old
+        pipeline, which ships the same adapter with merge disabled and holds
+        real time comfortably on the same RTX 5090, so unmerged is a proven
+        configuration rather than a cost to engineer around.
 
-        This adapter's target_modules are ["proj", "fc1", "out_proj", "fc2",
-        "linear", "in_proj"], which PEFT matches by suffix -- so it attaches to
-        very nearly every projection in the 7B model, main transformer and
-        depformer alike, at r=128 with alpha/r=2.0. Left UNMERGED, every one of
-        those layers pays two extra matmuls on every forward pass, and this
-        model runs 12.5 forward passes per second for the entire session
-        (whether or not the turn uses search). In a pipeline that has to hold
-        real time, that is not an affordable tax: once the producer drops below
-        1x real time the audio sender -- which paces on a fixed 80ms grid --
-        starves continuously and the browser hears silence rather than choppy
-        speech.
+        Merging is additionally not available here: peft implements it as
+        `base_layer.weight.data += delta_weight`, and against a bnb-4bit base
+        that is a PACKED quantized blob, so it raises a shape mismatch
+        (25165824 vs 12288). `merge_lora=True` therefore just takes the loud
+        fallback path below and ends up unmerged anyway.
 
-        merge_and_unload() folds the adapter into the base weights once at
-        startup, so the live forward pass costs exactly what the base model
-        costs. On a bnb-4bit base PEFT dequantizes, adds, and requantizes,
-        which loses a little precision -- an acceptable trade for a real-time
-        pipeline, and the reason the fallback below is a loud warning rather
-        than a silent downgrade."""
+        PEFT mutates self.lm's target submodules in place, so self.lm keeps
+        pointing at the same -- now LoRA-augmented -- object either way. The
+        call site matters: this must run after the base LM is loaded and BEFORE
+        LMGen(...) captures CUDA graphs, or the graph bakes in the unmodified
+        forward pass and the adapter silently does nothing."""
         lora_path = Path(checkpoint_dir) / "lora"
         self.sys_logger.path("ref_lora_dir", lora_path, required=False)
         if not lora_path.exists():

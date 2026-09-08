@@ -173,7 +173,7 @@ class MoshiOnlyEngine:
         # Identical surface to liveTry.MoshiOnlyEngine, so the caller does not
         # have to know which engine the PROMPT_CACHE switch selected.
         ref_lora_dir: str = "",
-        merge_ref_lora: bool = True,
+        merge_ref_lora: bool = False,
         max_ref_tokens: int = 250,
         stt_hf_repo: str = "",
         stt_pkg_dir: str = "",

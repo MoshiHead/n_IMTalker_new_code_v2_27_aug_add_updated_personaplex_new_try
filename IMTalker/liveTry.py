@@ -105,7 +105,7 @@ class MoshiOnlyEngine:
         stt_reject_foreign_script: bool = True,
         stt_max_non_latin_ratio: float = 0.15,
         stt_require_english: bool = True,
-        max_input_buffer_sec: float = 6.0,
+        max_input_buffer_sec: float = 2.0,
         compressor_model: str = "",
         compressor_device: str = "cuda",
         compressor_4bit: bool = True,

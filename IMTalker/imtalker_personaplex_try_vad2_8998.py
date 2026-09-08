@@ -210,9 +210,15 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         search_max_filler_sec: float = 6.0,
         stt_inline: bool = False,
         stt_queue_frames: int = 64,
+        wait_for_user_before_speaking: bool = True,
         **kwargs,
     ) -> None:
         self.tf_capture_layer = int(capture_layer)
+        # Both must exist before super().__init__(), which runs reset_session()
+        # and can reach _step() during warmup.
+        self.wait_for_user_before_speaking = bool(wait_for_user_before_speaking)
+        self._user_has_spoken = False
+        self._loud_input_frames = 0
         # Must exist before super().__init__() -- it runs reset_session() during
         # warmup, and _step() can be reached from there.
         self.stt_inline = bool(stt_inline)
@@ -690,6 +696,10 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         # later it is already mid-sentence with an invented figure and simply
         # finishes it.
         self.suppress_text_until_ref = False
+        # Cleared for every new session: a fresh conversation has to earn the
+        # model's first word again.
+        self._user_has_spoken = False
+        self._loud_input_frames = 0
         self._pending_ref_token_counts = (0, 0)
         self.search_filler_frame_count = 0
         self.search_session_history: list[tuple[str, str]] = []
@@ -766,6 +776,14 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
     def _stt_submit(self, chunk: torch.Tensor) -> None:
         """GPU thread: hand this 80ms frame to the STT worker. Never blocks.
 
+        The frame is queued together with `len(self.audio_text)` AS OF NOW.
+        That pairing is the whole reason this is correct: the worker reaches
+        this frame some time later, and if it read audio_text then, it would
+        read the GPU thread's position at that later moment instead of the
+        position this frame belongs to. The boundary would land past the start
+        of the model's reply, and the reply recorded for the turn would begin
+        mid-sentence -- which is exactly what the transcripts showed.
+
         `chunk` is freshly allocated by _step() every call and is never mutated
         afterwards, so it can be handed over by reference -- no copy, no extra
         device traffic on the critical path.
@@ -776,15 +794,16 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         stall the thread that generates audio and video."""
         if self._stt_queue is None:
             return
+        item = (chunk, len(self.audio_text))
         try:
-            self._stt_queue.put_nowait(chunk)
+            self._stt_queue.put_nowait(item)
             return
         except queue.Full:
             pass
         with contextlib.suppress(queue.Empty):
             self._stt_queue.get_nowait()
         try:
-            self._stt_queue.put_nowait(chunk)
+            self._stt_queue.put_nowait(item)
         except queue.Full:
             pass
         self._stt_dropped_frames += 1
@@ -819,18 +838,19 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         )
         while not self._stt_stop.is_set():
             try:
-                chunk = self._stt_queue.get(timeout=0.1)
+                item = self._stt_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
-            if chunk is None:
+            if item is None:
                 break
+            chunk, audio_text_len = item
             try:
                 if stream is not None:
                     with torch.cuda.stream(stream):
-                        self._stt_forward(chunk)
+                        self._stt_forward(chunk, audio_text_len)
                     stream.synchronize()
                 else:
-                    self._stt_forward(chunk)
+                    self._stt_forward(chunk, audio_text_len)
             except Exception as e:
                 tb = traceback.format_exc()
                 print(
@@ -844,7 +864,7 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                 break
         print("[liveTryPlasticity][STT] worker thread stopped", flush=True)
 
-    def _stt_forward(self, chunk: torch.Tensor) -> None:
+    def _stt_forward(self, chunk: torch.Tensor, audio_text_len: int | None = None) -> None:
         """Run the STT/VAD submodel one 80ms frame forward and, on a detected
         end-of-utterance, publish the transcript for the GPU thread to act on.
 
@@ -852,10 +872,14 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         attributes shared with the GPU thread (`pending_transcript`, written
         here and read there; `search_awaiting_ref`, the reverse) -- never
         self.lm_gen, self.mimi, or any turn bookkeeping."""
+        if audio_text_len is None:
+            # Inline mode: this frame IS the current one, so now is the right
+            # moment to read the boundary.
+            audio_text_len = len(self.audio_text)
         with self._stt_lock:
-            self._stt_forward_locked(chunk)
+            self._stt_forward_locked(chunk, audio_text_len)
 
-    def _stt_forward_locked(self, chunk: torch.Tensor) -> None:
+    def _stt_forward_locked(self, chunk: torch.Tensor, audio_text_len: int) -> None:
         stt_codes = self.stt_mimi.encode(chunk)
         stt_result = self.stt_lm_gen.step_with_extra_heads(stt_codes)
         if stt_result is None:
@@ -868,12 +892,21 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             self.stt_token_buffer.append(stt_tokens[:, :1, :].cpu())
             text_token = stt_tokens[0, 0, 0].item()
             if text_token not in (0, self.stt_padding_token_id):
+                if not self._user_has_spoken:
+                    self._user_has_spoken = True
+                    print(
+                        "[liveTryPlasticity][search] first user speech detected -- "
+                        "the model may speak from here on",
+                        flush=True,
+                    )
                 if not self.stt_in_utterance:
                     # First real word of a new user utterance: everything the
                     # model emitted before this point belongs to the PREVIOUS
                     # turn's response, everything after is it reacting to what
-                    # it is hearing now.
-                    self._utterance_start_audio_text_len = len(self.audio_text)
+                    # it is hearing now. Use the position captured when this
+                    # frame was SUBMITTED, not the current one -- see
+                    # _stt_submit.
+                    self._utterance_start_audio_text_len = audio_text_len
                 self.stt_in_utterance = True
                 self.stt_last_vad_end = False
         if vad_score > self.vad_threshold:
@@ -931,7 +964,12 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         prev_response = search_helpers.strip_injected_tags(
             self.audio_text[self._turn_start_audio_text_len:resp_end]
         )
-        if prev_response:
+        # Only a turn that actually began has a response to close out. Without
+        # this, the very first utterance reports whatever the model composed
+        # before the conversation started as "turn 0", attributed to an empty
+        # question -- which is how prompt fragments ended up in the log as if
+        # they were an answer.
+        if prev_response and self.search_current_transcript:
             self.conv_logger.turn_replied(self.search_turn_epoch, prev_response)
             self.conv_logger.assistant_response(self.search_current_transcript, prev_response)
             self.conv_logger.narrate_response(
@@ -1583,7 +1621,17 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         # untouched; only the words are withheld, and precisely while the model
         # would otherwise be inventing an answer it is about to be handed.
         t_lm0 = time.perf_counter()
-        if self.suppress_text_until_ref and self._step_supports_text_token:
+        # Hold the model's words until the user has actually said something.
+        # Same native mechanism as the search suppression below -- a provided
+        # text token rather than a sampled one -- so audio, hidden states and
+        # chunk cadence are unaffected and only the words wait.
+        wait_for_user = (
+            self.wait_for_user_before_speaking
+            and not self._user_has_spoken
+            and self.stt_lm_gen is not None
+            and not self.search_hard_disabled
+        )
+        if (self.suppress_text_until_ref or wait_for_user) and self._step_supports_text_token:
             lm_out = self.lm_gen._step(
                 codes[:, :, :1], text_token=getattr(self.lm_gen, "zero_text_code", 3)
             )
@@ -1677,6 +1725,25 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         reply_rms = float(np.sqrt(np.mean(np.square(reply_pcm, dtype=np.float32))))
         reply_peak = float(np.max(np.abs(reply_pcm))) if reply_pcm.size else 0.0
         input_rms = float(np.sqrt(np.mean(np.square(pcm24, dtype=np.float32))))
+
+        # Independent release for the wait-for-user gate. The STT text stream is
+        # the precise signal, but making it the ONLY one would mean a
+        # tokenization failure mutes the avatar for the whole session -- a much
+        # worse outcome than the startup babble the gate exists to prevent. Loud
+        # microphone input for a quarter of a second is enough to conclude
+        # somebody is talking, whatever STT makes of it.
+        if self.wait_for_user_before_speaking and not self._user_has_spoken:
+            if input_rms > self._SPEECH_RMS_THRESHOLD:
+                self._loud_input_frames += 1
+                if self._loud_input_frames >= 3:
+                    self._user_has_spoken = True
+                    print(
+                        f"[liveTryPlasticity] user audio detected "
+                        f"(in_rms={input_rms:.5f}) -- releasing the model to speak",
+                        flush=True,
+                    )
+            else:
+                self._loud_input_frames = 0
         encode_ms = 1000.0 * (t_encode1 - t_encode0)
         lm_ms = 1000.0 * (t_lm1 - t_lm0)
         total_ms = 1000.0 * (time.perf_counter() - t0)
@@ -3324,6 +3391,25 @@ class LiveHeliumFMOptions(BaseOptions):
         )
         parser.add_argument("--max_ref_tokens", type=int, default=250, help="Cap on injected <ref> block length, in tokens")
         parser.add_argument(
+            "--wait_for_user", action=argparse.BooleanOptionalAction, default=True,
+            help="Withhold the model's words until the user has actually spoken. "
+                 "On by default: at session start the model otherwise free-runs "
+                 "from the system prompt and reads fragments of it aloud, which "
+                 "also commits it to a topic before the first question arrives. "
+                 "Requires STT (that is what detects the first word). Use "
+                 "--no-wait_for_user if you want a greeting before the user speaks.",
+        )
+        parser.add_argument(
+            "--spoken_form_numbers", action="store_true",
+            help="Spell numbers out in words in the injected summary "
+                 "(\"three hundred nine dollars\" instead of \"$309.32\"). OFF by "
+                 "default, and the default is deliberate: PersonaPlex already reads "
+                 "digits aloud correctly, whereas spelled-out numbers force it to "
+                 "re-encode the value and it drops magnitudes -- $309.32 was spoken "
+                 "back as $39.32, and a euro price came back in dollars. Markdown, "
+                 "brackets and citation markers are stripped either way.",
+        )
+        parser.add_argument(
             "--router_threshold", type=float, default=0.40,
             help="P(needs live data) at or above which the router sends a question to web search. "
                  "Deliberately below 0.5: searching unnecessarily costs a couple of seconds of "
@@ -3367,7 +3453,7 @@ class LiveHeliumFMOptions(BaseOptions):
         parser.add_argument("--stt_hf_repo", default="", help="HF repo for the STT/VAD submodel, e.g. kyutai/stt-1b-en_fr-candle. Omit to disable routing/search entirely (no transcript, no turn-detection signal).")
         parser.add_argument("--stt_pkg_dir", default="", help="Dir containing an isolated `pip install --no-deps --target <dir> moshi` install of the upstream Kyutai moshi package")
         parser.add_argument(
-            "--max_input_buffer_sec", type=float, default=6.0,
+            "--max_input_buffer_sec", type=float, default=2.0,
             help="Maximum seconds of unprocessed microphone audio to keep. THE most important "
                  "latency control in this server: the GPU producer is rate-limited to exactly real "
                  "time by frame_q backpressure, so it can never drain a backlog. Without this cap "
@@ -3587,7 +3673,8 @@ def build_app(args: argparse.Namespace) -> FastAPI:
         "router_rules", "web_search_enabled", "web_search_api_key", "web_search_provider",
         "web_search_max_results", "web_search_timeout", "web_search_min_score",
         "search_max_filler_sec", "thinking_sound_path", "conversation_log_dir",
-        "suppress_text_during_search", "vad_threshold",
+        "suppress_text_during_search", "vad_threshold", "spoken_form_numbers",
+        "wait_for_user",
     ])
     sys_log.section("checkpoints and assets")
     for role, value, required in (
@@ -3660,6 +3747,18 @@ def build_app(args: argparse.Namespace) -> FastAPI:
     def get_moshi_engine() -> MoshiOnlyEngine:
         nonlocal moshi_engine
         if moshi_engine is None:
+            # Set before the engine exists: this decides both the compressor's
+            # prompt and how its output is normalised, and the two must agree
+            # from the very first turn.
+            with contextlib.suppress(Exception):
+                import search_helpers
+                search_helpers.set_spell_numbers(
+                    bool(getattr(args, "spoken_form_numbers", False))
+                )
+                system_logger.get().config(
+                    "spoken_form_numbers",
+                    bool(getattr(args, "spoken_form_numbers", False)),
+                )
             moshi_engine = MoshiOnlyEngineWithHidden(
                 moshi_root=args.moshi_root,
                 mimi_hf_repo=args.mimi_hf_repo,
@@ -3684,6 +3783,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                 stt_pkg_dir=getattr(args, "stt_pkg_dir", ""),
                 vad_threshold=float(getattr(args, "vad_threshold", 0.5)),
                 suppress_text_during_search=bool(int(getattr(args, "suppress_text_during_search", 1))),
+                wait_for_user_before_speaking=bool(getattr(args, "wait_for_user", True)),
                 prompt_settle_sec=float(getattr(args, "prompt_settle_sec", 0.0)),
                 stt_reject_foreign_script=bool(int(getattr(args, "stt_reject_foreign_script", 1))),
                 stt_max_non_latin_ratio=float(getattr(args, "stt_max_non_latin_ratio", 0.15)),

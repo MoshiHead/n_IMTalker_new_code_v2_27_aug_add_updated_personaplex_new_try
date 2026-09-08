@@ -39,7 +39,10 @@ from typing import Optional
 import numpy as np
 import torch
 
-from speech_text import SPOKEN_STYLE_RULES, normalize_for_speech
+from speech_text import PLAIN_TEXT_RULES, SPOKEN_STYLE_RULES, normalize_for_speech
+
+# See set_spell_numbers(). Off matches the old pipeline.
+_SPELL_NUMBERS = False
 
 _SYMBOL_RE = re.compile(r"[*_#`~]+")
 
@@ -875,7 +878,7 @@ def summarize_web_fallback(
     if terminated:
         sentences = terminated
     if not sentences:
-        return normalize_for_speech(full_text[:max_chars])
+        return normalize_for_speech(full_text[:max_chars], spell_numbers=_SPELL_NUMBERS)
 
     query_words = _content_words(transcript)
     scored = []
@@ -888,14 +891,14 @@ def summarize_web_fallback(
         # by containing more words than a short, precise answer.
         scored.append((overlap / (len(sent_words) ** 0.5), idx))
     if not scored:
-        return normalize_for_speech(" ".join(sentences[:max_sentences])[:max_chars])
+        return normalize_for_speech(" ".join(sentences[:max_sentences])[:max_chars], spell_numbers=_SPELL_NUMBERS)
 
     scored.sort(reverse=True)
     chosen = sorted(idx for _, idx in scored[:max_sentences])
     # Truncate BEFORE normalizing: max_chars bounds the SOURCE sentences.
     # Cutting spoken-form output instead would clip mid-word ("...forty-one
     # cen"), which is far worse to hear than one slightly longer sentence.
-    return normalize_for_speech(" ".join(sentences[i] for i in chosen)[:max_chars])
+    return normalize_for_speech(" ".join(sentences[i] for i in chosen)[:max_chars], spell_numbers=_SPELL_NUMBERS)
 
 
 # ── Context compressor: small LLM, query + top-k hits -> 1-2 sentence grounding ──
@@ -988,7 +991,7 @@ class ContextCompressor:
             "- Ignore advertising, slogans, menus, image captions, and any text about the "
             "website or seller itself -- it is page furniture, not an answer.\n"
             "- Plain text only: no markdown, no lead-in phrase, no citation markers.\n"
-            + SPOKEN_STYLE_RULES +
+            + (SPOKEN_STYLE_RULES if _SPELL_NUMBERS else PLAIN_TEXT_RULES) +
             "- Never reply conversationally. You are writing a fact for someone else to say, "
             "not talking to the user: never answer with \"Yes, I can...\", an offer to help, or "
             "a comment about yourself. If the question is phrased as a yes/no request such as "
@@ -1051,7 +1054,7 @@ class ContextCompressor:
         # cannot tell whether an odd sentence came from the model or from the
         # normalizer.
         self.last_raw_result = result
-        spoken = normalize_for_speech(result)
+        spoken = normalize_for_speech(result, spell_numbers=_SPELL_NUMBERS)
         if spoken != result:
             print(
                 f"[search_helpers][compressor] spoken form: {result!r} -> {spoken!r}",
@@ -1071,6 +1074,16 @@ class ContextCompressor:
 # upstream package from an isolated install directory under a private alias
 # (`moshi_stt`) via importlib, so it never touches `sys.modules["moshi"]` and
 # never fights with the PersonaPlex fork for the name.
+
+def set_spell_numbers(enabled: bool) -> None:
+    """Choose whether injected text spells numbers out in words.
+
+    Off by default. PersonaPlex reads "$309.32" aloud correctly on its own;
+    handing it "three hundred nine dollars and thirty-two cents" makes it
+    re-encode the value and it drops magnitudes. See normalize_for_speech."""
+    global _SPELL_NUMBERS
+    _SPELL_NUMBERS = bool(enabled)
+
 
 def load_upstream_moshi_stt(stt_pkg_dir: str):
     """Load the genuine upstream Kyutai `moshi` PyPI package (installed via

@@ -53,10 +53,13 @@ LOG_DIR="${LOG_DIR:-$ROOT/logs}"
 # That is how a pipeline whose floor is ~2-4s ends up answering 10-12s late.
 # With the cap, the oldest audio is dropped (and the drop logged) so the delay
 # is bounded no matter what happens. Set 0 for the old unbounded behaviour.
-# 6.0s = three generation chunks. 2.0s was one chunk, which is too tight: a
-# single chunk-boundary stall then starts destroying speech instead of absorbing
-# the hiccup. Raise it further to trade latency for completeness.
-MAX_INPUT_BUFFER_SEC="${MAX_INPUT_BUFFER_SEC:-6.0}"
+# 2.0s, matching the old pipeline. Raising it to 6.0 to absorb chunk-boundary
+# stalls was a mistake: the cap is not just a drop threshold, it is the ceiling
+# on how STALE the audio the model answers is allowed to be. At 6.0 the model
+# can be replying to a question that finished six seconds ago while the user has
+# already moved on, and measured first-word latency reached 16.1s and 47.6s.
+# Raise it only if you would rather lose the start of a sentence than answer late.
+MAX_INPUT_BUFFER_SEC="${MAX_INPUT_BUFFER_SEC:-2.0}"
 # 8, matching the old pipeline's proven start_winner_live.sh. This is a VRAM
 # setting first and a latency setting second: the renderer's cross-attention at
 # resolution 64 allocates batch x 8 heads x 4096 x 4096 x 4 bytes, so 10 frames
@@ -155,6 +158,22 @@ if [[ "$ENABLE_SEARCH" == "1" ]]; then
     --stt_queue_frames "${STT_QUEUE_FRAMES:-64}"
   )
   [[ "${STT_INLINE:-0}" == "1" ]] && SEARCH_ARGS+=(--stt_inline)
+  # SPOKEN_FORM_NUMBERS=1 spells numbers out in words in the injected summary
+  # ("three hundred nine dollars" instead of "$309.32"). OFF by default, and
+  # that default is deliberate: PersonaPlex already reads digits aloud
+  # correctly, while spelled-out numbers force it to re-encode the value and it
+  # drops magnitudes -- $309.32 came back as $39.32 and a euro price came back
+  # in dollars. Markdown, brackets and citation markers are stripped either way.
+  [[ "${SPOKEN_FORM_NUMBERS:-0}" == "1" ]] && SEARCH_ARGS+=(--spoken_form_numbers)
+  # WAIT_FOR_USER=0 lets the model speak before the user has said anything. On
+  # by default: otherwise it free-runs from the system prompt at session start
+  # and reads fragments of it aloud, and arrives at the first real question
+  # already committed to a topic.
+  if [[ "${WAIT_FOR_USER:-1}" == "1" ]]; then
+    SEARCH_ARGS+=(--wait_for_user)
+  else
+    SEARCH_ARGS+=(--no-wait_for_user)
+  fi
   # The reference LoRA runs UNMERGED, exactly as the old pipeline does -- it
   # ships the same adapter with merge disabled and holds real time on the same
   # GPU. Merging is also impossible against a bnb-4bit base (peft adds a dense

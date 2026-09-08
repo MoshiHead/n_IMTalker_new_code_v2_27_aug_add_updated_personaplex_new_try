@@ -333,19 +333,23 @@ _QUOTES_RE = re.compile(r"[\"“”‘’«»]")
 # run: what remains is something it deliberately declined to touch, and a
 # digit read aloud is far better than a deleted one.
 _RESIDUAL_RE = re.compile(r"[^\w\s.,!?'\-]", re.UNICODE)
+# Same as _RESIDUAL_RE but keeps currency and percent signs. Used when numbers
+# are left as digits: stripping "$" off "$309.32" would silently change the
+# fact, which is worse than keeping one symbol the audio decoder handles fine.
+_RESIDUAL_KEEP_UNITS_RE = re.compile(r"[^\w\s.,!?'\-$€£¥₹₩₽₺৳%]", re.UNICODE)
 _SPACES_RE = re.compile(r"\s+")
 _SPACE_BEFORE_PUNCT_RE = re.compile(r"\s+([.,!?])")
 _REPEAT_PUNCT_RE = re.compile(r"([.,!?])\1+")
 _ORPHAN_HYPHEN_RE = re.compile(r"(?<![\w])-+|-+(?![\w])")
 
 
-def _strip_symbols(text: str) -> str:
+def _strip_symbols(text: str, keep_units: bool = False) -> str:
     text = _MARKUP_RE.sub(" ", text)
     text = _PARENS_RE.sub(" ", text)
     text = _QUOTES_RE.sub(" ", text)
     for pattern, replacement in _SYMBOL_WORDS:
         text = pattern.sub(replacement, text)
-    text = _RESIDUAL_RE.sub(" ", text)
+    text = (_RESIDUAL_KEEP_UNITS_RE if keep_units else _RESIDUAL_RE).sub(" ", text)
     text = _ORPHAN_HYPHEN_RE.sub(" ", text)
     text = _SPACES_RE.sub(" ", text)
     text = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", text)
@@ -362,8 +366,24 @@ def _capitalize_sentences(text: str) -> str:
 
 # ── Public entry point ──────────────────────────────────────────────────────
 
-def normalize_for_speech(text: str, ensure_terminal_period: bool = True) -> str:
-    """Convert a summary into clean, fully spoken-form text.
+def normalize_for_speech(
+    text: str,
+    ensure_terminal_period: bool = True,
+    spell_numbers: bool = False,
+) -> str:
+    """Clean a summary for speech, optionally spelling numbers out in words.
+
+    `spell_numbers` defaults to FALSE, and that default is load-bearing rather
+    than a preference. PersonaPlex reads "$309.32" aloud as "three hundred nine
+    dollars and thirty-two cents" by itself -- the conversion belongs to its
+    audio decoder, which does it reliably. Handing it the words instead forces
+    the model to re-encode them, and it drops magnitudes: "three hundred nine
+    dollars and thirty-two cents" came back as "$39.32", and a euro figure came
+    back with a dollar sign. Digits survive because the model only has to copy
+    them.
+
+    Symbol and markdown stripping runs either way. That part never changes a
+    value, so it is safe on every injection.
 
     Order matters and is not arbitrary: currency must claim its digits before
     the plain-number pass sees them, and the symbol filter must run last so it
@@ -380,9 +400,10 @@ def normalize_for_speech(text: str, ensure_terminal_period: bool = True) -> str:
         # equivalents so the numeric patterns below can actually see them.
         out = unicodedata.normalize("NFKC", str(text))
         out = _RANGE_RE.sub(" to ", out)
-        out = _expand_currency(out)
-        out = _expand_numbers(out)
-        out = _strip_symbols(out)
+        if spell_numbers:
+            out = _expand_currency(out)
+            out = _expand_numbers(out)
+        out = _strip_symbols(out, keep_units=not spell_numbers)
         out = _capitalize_sentences(out)
         if ensure_terminal_period and out and out[-1] not in ".!?":
             out += "."
@@ -395,6 +416,16 @@ def normalize_for_speech(text: str, ensure_terminal_period: bool = True) -> str:
 # Instruction block appended to the compressor prompt so the model produces
 # spoken form directly. `normalize_for_speech` still runs afterwards -- the
 # prompt improves the odds, the normalizer is what guarantees the result.
+PLAIN_TEXT_RULES = (
+    "- Plain words and digits only: no markdown, no brackets, no quotation "
+    "marks, no citation markers. Keep the currency or percent sign that belongs "
+    "to a number, and keep the number itself in digits -- write \"$325\", not "
+    "\"325\" and not \"three hundred twenty-five dollars\". The speech model "
+    "reads digits aloud correctly and mis-reads spelled-out numbers.\n"
+)
+
+# Only appended when --spoken_form_numbers is on. See normalize_for_speech for
+# why spelling numbers into the injected text makes the spoken answer worse.
 SPOKEN_STYLE_RULES = (
     "- Write the sentence exactly as it should be SPOKEN ALOUD. Use plain words "
     "only: no symbols, no markdown, no brackets, no quotation marks, no "

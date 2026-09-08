@@ -57,10 +57,14 @@ LOG_DIR="${LOG_DIR:-$ROOT/logs}"
 # single chunk-boundary stall then starts destroying speech instead of absorbing
 # the hiccup. Raise it further to trade latency for completeness.
 MAX_INPUT_BUFFER_SEC="${MAX_INPUT_BUFFER_SEC:-6.0}"
-# 50 frames / 10 = 5 exact sub-batches, so the renderer never pads a short tail
-# and pays fewer Python round-trips than the previous 6. Same output frames,
-# less wall time on the reply path. Lower it if the GPU is short on VRAM.
-RENDER_SUB_BATCH="${RENDER_SUB_BATCH:-10}"
+# 8, matching the old pipeline's proven start_winner_live.sh. This is a VRAM
+# setting first and a latency setting second: the renderer's cross-attention at
+# resolution 64 allocates batch x 8 heads x 4096 x 4096 x 4 bytes, so 10 frames
+# is a single 5.00 GiB block and 8 frames is 4.00 GiB. With the search models
+# resident (STT 1B + Qwen 1.5B + LoRA, ~3.4 GB) the 10-frame block no longer fit
+# and the render thread died of an OOM, which silenced the avatar for the rest
+# of the session. Raise it only if you have measured the headroom.
+RENDER_SUB_BATCH="${RENDER_SUB_BATCH:-8}"
 # 90 is visually indistinguishable from 82 here but encodes and transfers
 # noticeably more slowly. Raise it back to 90 if you prefer the extra headroom.
 JPEG_QUALITY="${JPEG_QUALITY:-82}"

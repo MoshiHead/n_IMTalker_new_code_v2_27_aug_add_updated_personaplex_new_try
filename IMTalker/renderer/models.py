@@ -176,15 +176,25 @@ class IMTRenderer(nn.Module):
     def decode(self, A, B, C):
         num_levels = len(self.spatial_dims)
         aligned_features = [None] * num_levels
-        attention_map = None
+        # Only the head-mean of the coarse map is ever consumed downstream, so
+        # reduce immediately and let the full (B, heads, N, N) tensor go. At
+        # resolution 64 that tensor is 5.00 GiB; keeping it in a local until the
+        # end of decode made it overlap with frame_decoder's own multi-GiB peak,
+        # which is what pushed the render thread into an OOM once the search
+        # models were sharing the card. Values are unchanged -- previously each
+        # fine stage recomputed this same mean itself.
+        attn_mean = None
         for i in range(num_levels):
             attention_block = self.imt[i]
             if attention_block.is_standard_attention:
-                aligned_feature, attention_map = attention_block.coarse_stage(A[i], B[i], C[i])
+                aligned_feature, attn_mean = attention_block.coarse_stage_mean(
+                    A[i], B[i], C[i]
+                )
                 aligned_features[i] = aligned_feature
             else:
-                aligned_feature = attention_block.fine_stage(C[i], attn=attention_map)
+                aligned_feature = attention_block.fine_stage_mean(C[i], attn_mean=attn_mean)
                 aligned_features[i] = aligned_feature
+        del attn_mean
         output_frame = self.frame_decoder(aligned_features)
         return output_frame
     

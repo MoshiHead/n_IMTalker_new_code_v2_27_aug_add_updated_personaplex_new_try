@@ -1,7 +1,18 @@
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from timm.models.layers import to_2tuple, trunc_normal_
+
+# Above this many bytes, an attention map whose head-mean is all the caller
+# wants gets accumulated one head at a time instead of built whole. Only the
+# resolution-64 cross-attention reaches this in this renderer; everything
+# smaller keeps the single batched matmul. Set IMTALKER_ATTN_HEAD_CHUNK_BYTES=0
+# to force the original single-allocation path everywhere.
+_ATTN_HEAD_CHUNK_BYTES = int(
+    os.environ.get("IMTALKER_ATTN_HEAD_CHUNK_BYTES", str(1 << 30))
+)
 
 def window_partition(x, window_size):
     B, H, W, C = x.shape
@@ -32,12 +43,65 @@ class StandardUnifiedAttention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, query, key, value, mask=None):
+    def forward(self, query, key, value, mask=None, need_weights=True):
+        """When `need_weights` is False the attention map is never built.
+
+        The map is a (B, heads, N, N) tensor. At renderer resolution 64 with a
+        10-frame sub-batch that is 10 x 8 x 4096 x 4096 x 4 = 5.00 GiB, and on
+        the self-attention path the caller discards it immediately. Building it
+        there cost 5 GiB of headroom for nothing, and once the search models
+        (STT 1B + Qwen 1.5B + LoRA, ~3.4 GB) shared the card, that allocation no
+        longer fit and took the whole render thread down with an OOM.
+
+        F.scaled_dot_product_attention is the same mathematics through a fused
+        kernel that never materialises the matrix, so this is a memory fix, not
+        an approximation. Callers that actually consume the map -- CrossAttention
+        feeding GuidedResampler -- keep the default and the original code path."""
         B, N, C = query.shape
 
         q = self.q_proj(query).view(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
         k = self.k_proj(key).view(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
         v = self.v_proj(value).view(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+
+        if need_weights == "mean":
+            # The caller wants only the head-mean. Accumulate it head by head so
+            # the full (B, heads, N, N) tensor never exists: at resolution 64
+            # that is 1.0 GiB in flight instead of 4.00 GiB, which is the
+            # difference between rendering and an OOM once the search models are
+            # sharing the card. Small maps keep the batched path -- eight
+            # sequential matmuls are not worth it to save a few hundred MiB.
+            map_bytes = B * self.num_heads * N * N * q.element_size()
+            if mask is None and _ATTN_HEAD_CHUNK_BYTES and map_bytes > _ATTN_HEAD_CHUNK_BYTES:
+                out = torch.empty_like(q)
+                mean_map = torch.zeros(B, N, N, dtype=q.dtype, device=q.device)
+                inv_h = 1.0 / float(self.num_heads)
+                for h in range(self.num_heads):
+                    a_h = (q[:, h] @ k[:, h].transpose(-2, -1)) * self.scale
+                    a_h = a_h.softmax(dim=-1)
+                    mean_map.add_(a_h, alpha=inv_h)
+                    out[:, h] = self.attn_drop(a_h) @ v[:, h]
+                    del a_h
+                x = out.transpose(1, 2).reshape(B, N, C)
+                x = self.proj(x)
+                x = self.proj_drop(x)
+                return x, mean_map
+            x, attn_map = self.forward(query, key, value, mask=mask, need_weights=True)
+            return x, attn_map.mean(dim=1)
+
+        if not need_weights:
+            attn_mask = None
+            if mask is not None:
+                # Same semantics as the masked_fill below: 0 means "not allowed".
+                attn_mask = mask.to(torch.bool)
+            x = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=self.attn_drop.p if self.training else 0.0,
+            )
+            x = x.transpose(1, 2).reshape(B, N, C)
+            x = self.proj(x)
+            x = self.proj_drop(x)
+            return x, None
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
 
@@ -219,7 +283,11 @@ class UnifiedTransformerBlock(nn.Module):
         k_norm = self.norm_kv(k_in + self.k_pos_embedding)
         v_norm = self.norm_kv(v_in)
         
-        attn_output, _ = self.attn(query=q_norm, key=k_norm, value=v_norm)
+        # need_weights=False: the map is discarded on the next line, and at
+        # resolution 64 building it costs 5 GiB of VRAM for nothing.
+        attn_output, _ = self.attn(
+            query=q_norm, key=k_norm, value=v_norm, need_weights=False
+        )
         
         x = shortcut + attn_output
         x = x + self.mlp(self.norm_ffn(x))
@@ -328,9 +396,30 @@ class CrossAttention(nn.Module):
         out = out_seq.transpose(1, 2).view(B_, C_, H, W)
         return out, attn_map
     
+    def coarse_stage_mean(self, A, B, C):
+        """coarse_stage, but returns the head-mean of the attention map.
+
+        Downstream only ever uses the mean, and asking for it here lets the
+        attention build it incrementally instead of materialising all heads."""
+        B_, C_, H, W = A.shape
+        A_seq = A.flatten(2).transpose(1, 2)
+        B_seq = B.flatten(2).transpose(1, 2)
+        C_seq = C.flatten(2).transpose(1, 2)
+        out_seq, attn_mean = self.block_efc(A_seq, B_seq, C_seq, need_weights="mean")
+        out = out_seq.transpose(1, 2).view(B_, C_, H, W)
+        return out, attn_mean
+
     def fine_stage(self, C, attn=None):
         out = self.block(C, attn.mean(dim=1))
         return out
+
+    def fine_stage_mean(self, C, attn_mean=None):
+        """Same as fine_stage, but the caller has already taken the head-mean.
+
+        Letting the caller reduce once means the full (B, heads, N, N) map -- 5
+        GiB at resolution 64 -- can be freed as soon as it is produced, instead
+        of being held alive until every fine stage has re-reduced it."""
+        return self.block(C, attn_mean)
     
     def forward(self, A, B, C, D, attn=None):
 

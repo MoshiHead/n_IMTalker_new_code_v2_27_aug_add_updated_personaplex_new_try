@@ -1771,7 +1771,8 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
 # Utilities
 # ---------------------------------------------------------------------------
 
-def _supervise(name: str, fn, on_error=None):
+def _supervise(name: str, fn, on_error=None, max_restarts: int = 0,
+               restart_delay_s: float = 0.5):
     """Wrap a long-lived thread body so a crash is LOUD and lands in both logs.
 
     Every media thread here is a daemon started with threading.Thread(target=...).
@@ -1781,27 +1782,111 @@ def _supervise(name: str, fn, on_error=None):
     search threads keep running -- so the conversation log continues to look
     completely healthy and the only evidence is a traceback in a file nobody
     thinks to check. Both structured logs must record a thread death, because
-    "the avatar went quiet" and "a thread died" have to be connectable."""
+    "the avatar went quiet" and "a thread died" have to be connectable.
+
+    With `max_restarts` the body is re-entered after a crash. That is only safe
+    for a body that owns all of its mutable state as locals -- the GPU producer
+    does -- so re-entering gives a clean stream with the loaded models still
+    resident. The budget is finite so a deterministic fault cannot spin."""
 
     def _runner():
-        try:
-            fn()
-        except BaseException as e:  # noqa: BLE001 - a dying thread must be reported
-            tb = traceback.format_exc()
-            print(f"[THREAD-DIED] {name}: {e!r}\n{tb}", flush=True)
-            with contextlib.suppress(Exception):
-                system_logger.get().component_failed(f"thread:{name}", e, tb)
-            if on_error is not None:
+        attempt = 0
+        while True:
+            try:
+                fn()
+            except BaseException as e:  # noqa: BLE001 - a dying thread must be reported
+                tb = traceback.format_exc()
+                print("[THREAD-DIED] %s: %r\n%s" % (name, e, tb), flush=True)
                 with contextlib.suppress(Exception):
-                    on_error(e, tb)
-        else:
-            print(f"[THREAD-EXIT] {name} returned normally", flush=True)
-            with contextlib.suppress(Exception):
-                system_logger.get().event(
-                    "thread_exit", f"{name} returned normally", thread=name
+                    system_logger.get().component_failed("thread:" + name, e, tb)
+                if on_error is not None:
+                    with contextlib.suppress(Exception):
+                        on_error(e, tb)
+                if attempt >= max_restarts:
+                    if max_restarts:
+                        print(
+                            f"[THREAD-DIED] {name}: restart budget exhausted "
+                            f"({max_restarts}); staying down.",
+                            flush=True,
+                        )
+                        with contextlib.suppress(Exception):
+                            system_logger.get().event(
+                                "thread_restart_exhausted",
+                                f"{name} crashed {attempt + 1} times; not restarting again",
+                                thread=name, restarts=attempt,
+                            )
+                    return
+                attempt += 1
+                # Reclaim whatever the dead attempt was holding before retrying;
+                # if the crash was an OOM, retrying without this just repeats it.
+                with contextlib.suppress(Exception):
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                print(
+                    f"[THREAD-RESTART] {name}: attempt {attempt}/{max_restarts} "
+                    f"in {restart_delay_s:.1f}s",
+                    flush=True,
                 )
+                with contextlib.suppress(Exception):
+                    system_logger.get().event(
+                        "thread_restart",
+                        f"{name} crashed and is being restarted "
+                        f"(attempt {attempt} of {max_restarts})",
+                        thread=name, attempt=attempt, max_restarts=max_restarts,
+                    )
+                time.sleep(restart_delay_s)
+            else:
+                print(f"[THREAD-EXIT] {name} returned normally", flush=True)
+                with contextlib.suppress(Exception):
+                    system_logger.get().event(
+                        "thread_exit", f"{name} returned normally", thread=name
+                    )
+                return
 
     return _runner
+
+
+def _log_vram_headroom(fm_engine, args) -> None:
+    """Write down how much VRAM is left once everything is resident.
+
+    Every model is loaded by this point -- PersonaPlex, Mimi, the FM generator,
+    the FP32 renderer, and with search on the STT model, the router/compressor
+    and the reference LoRA. What is left over is what the renderer has to do its
+    work in, and when that number is small the failure is an OOM on the render
+    thread, which reads to the user as an avatar that never speaks.
+
+    The estimate is the renderer's dominant transient: the resolution-64
+    attention, batch x heads x N x N x 4 bytes. It is the allocation that
+    actually failed, so it is the right thing to compare headroom against."""
+    if not torch.cuda.is_available():
+        return
+    with contextlib.suppress(Exception):
+        free_b, total_b = torch.cuda.mem_get_info()
+        free_gb = free_b / (1 << 30)
+        sub_batch = max(1, int(getattr(args, "render_sub_batch", 8)))
+        # 64x64 tokens, 8 heads, fp32 -- one head at a time plus the running
+        # mean, which is what the renderer now holds rather than all heads.
+        est_peak_gb = 2 * sub_batch * (64 * 64) ** 2 * 4 / (1 << 30)
+        fits = free_gb > est_peak_gb * 1.5
+        msg = (
+            f"free={free_gb:.2f}GB of {total_b / (1 << 30):.2f}GB after all models; "
+            f"renderer needs about {est_peak_gb:.2f}GB per sub-batch of {sub_batch} frames"
+        )
+        if not fits:
+            msg += (
+                " -- this is tight. If the avatar goes silent, lower "
+                "--render_sub_batch or run with ENABLE_SEARCH=0."
+            )
+        print(f"[VRAM] {msg}", flush=True)
+        system_logger.get().gpu_memory("after FM engine and renderer")
+        system_logger.get().event(
+            "vram_headroom", msg,
+            free_gb=round(free_gb, 2),
+            total_gb=round(total_b / (1 << 30), 2),
+            render_sub_batch=sub_batch,
+            est_render_peak_gb=round(est_peak_gb, 2),
+            comfortable=bool(fits),
+        )
 
 
 def _sync_cuda() -> None:
@@ -2881,6 +2966,60 @@ class LiveHeliumFMEngine:
         timings["total_ms"] = _ms(t_total)
         return frames_np, timings
 
+    @torch.no_grad()
+    def _render_motion_oom_safe(self, motion: torch.Tensor) -> tuple[np.ndarray, dict]:
+        """_render_motion, but an OOM halves the batch and retries instead of
+        killing the caller's thread.
+
+        Rendering is the largest transient allocation in the process: the
+        renderer's attention at resolution 64 is O(batch), so halving the batch
+        halves the peak. Recursing down to a single frame is worth trying before
+        giving up, because a single frame is roughly a tenth of the peak of a
+        full sub-batch and will fit in almost any surviving headroom.
+
+        If even one frame will not fit, the chunk is dropped and the caller
+        continues. A dropped chunk is a visible glitch; a dead producer thread is
+        a dead avatar for the rest of the session."""
+        try:
+            return self._render_motion(motion)
+        except torch.cuda.OutOfMemoryError:
+            n = int(motion.shape[0])
+            torch.cuda.empty_cache()
+            if n <= 1:
+                free_b, total_b = torch.cuda.mem_get_info()
+                msg = (
+                    f"renderer OOM on a single frame "
+                    f"(free={free_b / 2**30:.2f}GB of {total_b / 2**30:.2f}GB); "
+                    f"dropping this chunk and continuing"
+                )
+                print(f"[RENDER-OOM] {msg}", flush=True)
+                with contextlib.suppress(Exception):
+                    system_logger.get().event(
+                        "render_oom", msg,
+                        frames=n, free_gb=round(free_b / 2**30, 2),
+                        recovered=False,
+                    )
+                raise
+            half = n // 2
+            print(
+                f"[RENDER-OOM] sub-batch of {n} did not fit; retrying as "
+                f"{half}+{n - half}. Lower --render_sub_batch to avoid this.",
+                flush=True,
+            )
+            with contextlib.suppress(Exception):
+                system_logger.get().event(
+                    "render_oom",
+                    f"sub-batch of {n} frames did not fit; split into "
+                    f"{half}+{n - half} and continued",
+                    frames=n, split_into=[half, n - half], recovered=True,
+                )
+            first, t1 = self._render_motion_oom_safe(motion[:half])
+            second, t2 = self._render_motion_oom_safe(motion[half:])
+            timings = dict(t1)
+            timings["total_ms"] = float(t1.get("total_ms", 0.0)) + float(t2.get("total_ms", 0.0))
+            timings["oom_split"] = True
+            return np.concatenate([first, second], axis=0), timings
+
     def render_and_encode_subbatch(
         self,
         motion_sub: torch.Tensor,
@@ -2891,7 +3030,7 @@ class LiveHeliumFMEngine:
         total_gen_ms: float,
     ) -> list[dict]:
         """Render a sub-batch of frames, JPEG-encode in parallel, return packet dicts."""
-        frames_np, _render_info = self._render_motion(motion_sub)
+        frames_np, _render_info = self._render_motion_oom_safe(motion_sub)
 
         jpeg_futures = []
         for frame_rgb in frames_np:
@@ -2986,7 +3125,7 @@ async def stream_from_file(ws: WebSocket, engine: LiveHeliumFMEngine) -> None:
             sub = motion[sb_start:sb_start + engine.render_sub_batch].to(
                 engine.device, dtype=engine.dtype
             )
-            frames_np, render_info = engine._render_motion(sub)
+            frames_np, render_info = engine._render_motion_oom_safe(sub)
             render_ms += float(render_info["total_ms"])
             all_frames_np.extend(frames_np)
 
@@ -3717,6 +3856,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
         print("[SESSION-STRICT] acquired PersonaPlex session lock", flush=True)
         fm_engine = get_engine()
         fm_engine.reset_session()
+        _log_vram_headroom(fm_engine, args)
         if seedvc is not None:
             seedvc.reset()
         reply_engine = get_moshi_engine() if args.enable_moshi_reply else None
@@ -4715,7 +4855,8 @@ def build_app(args: argparse.Namespace) -> FastAPI:
             persona_thread.start()
             gpu_thread = threading.Thread(
                 target=_supervise(
-                    "gpu-producer", _gpu_producer_thread, _report_thread_death("gpu_producer")
+                    "gpu-producer", _gpu_producer_thread, _report_thread_death("gpu_producer"),
+                    max_restarts=3,
                 ),
                 daemon=True, name="gpu-producer",
             )
@@ -4872,7 +5013,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                             sub = motion[sb_start:sb_start + fm_engine.render_sub_batch].to(
                                 fm_engine.device, dtype=fm_engine.dtype
                             )
-                            frames_np, _ = fm_engine._render_motion(sub)
+                            frames_np, _ = fm_engine._render_motion_oom_safe(sub)
                             for j, frame_rgb in enumerate(frames_np):
                                 idx = emitted + sb_start + j
                                 await ws.send_json({

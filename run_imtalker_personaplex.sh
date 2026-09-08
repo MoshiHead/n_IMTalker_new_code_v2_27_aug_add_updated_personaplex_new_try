@@ -251,8 +251,12 @@ declare -A hashes=(
  ["$ROOT/checkpoints/lora/3robert_audio3_ditto_static_motion.pt"]="e29a41ff004b228d7efee15cad0f32f4d4bc5466563709e2ba78b158d4e340bb"
  ["$IM/checkpoints/renderer.ckpt"]="ca1686c1157b8ef5de43eabdeb846db4612694f5f74012be38742b0871808755"
  ["$ROOT/checkpoints/personaplex_lookahead_rms_adapter/stats/silence_helium_mean.pt"]="20a6d6eb58608d6d202bac46958e595e243635fdeeb8f04eb1afbe2ac7f2f16d"
- ["$ROOT/assets/ai-thinking-sound.wav"]="8b791899a993bd46e2781c39fb6a9d8249cfc0d8d19ec0b187f0e5edebd3f2db"
 )
+# NOTE: the thinking sound is deliberately NOT pinned. THINKING_SOUND_PATH is a
+# documented override, so replacing the clip is a supported action, and a pinned
+# hash would turn it into a launch failure. It is filler audio played while a
+# search runs -- it cannot affect a single word the model says -- and SHA256SUMS
+# still covers the copy that ships with the repo.
 # NOTE: the server sources (imtalker_personaplex_try_vad2_8998.py, liveTry.py,
 # liveTry_cached.py, search_helpers.py, conversation_logger.py,
 # system_logger.py, speech_text.py) are deliberately NOT pinned here any more.
@@ -261,12 +265,33 @@ declare -A hashes=(
 # integrity is covered by SHA256SUMS at the repo level; the entries kept above
 # are the immutable model/asset/vendored files, which is what the check was
 # actually protecting.
+checksum_failures=0
 for path in "${!hashes[@]}"; do
   expected="${hashes[$path]}"
   [[ "$expected" == __*__ ]] && continue
+  if [[ ! -f "$path" ]]; then
+    echo "Checksum check: MISSING  $path" >&2
+    echo "    re-run ./prepare_imtalker_personaplex.sh to download it" >&2
+    checksum_failures=$((checksum_failures + 1))
+    continue
+  fi
   actual="$(sha256sum "$path" | awk '{print $1}')"
-  [[ "$actual" == "$expected" ]] || { echo "Checksum mismatch: $path" >&2; exit 1; }
+  if [[ "$actual" != "$expected" ]]; then
+    echo "Checksum check: MODIFIED $path" >&2
+    echo "    expected $expected" >&2
+    echo "    actual   $actual" >&2
+    checksum_failures=$((checksum_failures + 1))
+  fi
 done
+if (( checksum_failures > 0 )); then
+  echo "" >&2
+  echo "$checksum_failures protected file(s) failed verification. These are model" >&2
+  echo "weights and vendored runtime files, so a mismatch means a bad or partial" >&2
+  echo "download rather than an edit you made. Re-run:" >&2
+  echo "    ./prepare_imtalker_personaplex.sh --hf-token <token>" >&2
+  echo "If you replaced one of these on purpose, update its hash in $0." >&2
+  exit 1
+fi
 
 source "$VENV_DIR/bin/activate"
 python - <<'PY'
